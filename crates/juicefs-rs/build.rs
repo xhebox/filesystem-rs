@@ -192,4 +192,11 @@ fn link(archive: Option<&Path>, lib: &str, target_os: &str) {
 	for lib in system {
 		println!("cargo:rustc-link-lib={lib}");
 	}
+
+	// `legacy_stdio_definitions.lib` carries two `.drectve` sections that disagree
+	// about their attributes; link.exe's LNK4078 for it is noise, and the
+	// workspace links with `-D warnings`.
+	if target_os == "windows" {
+		println!("cargo:rustc-link-arg=/ignore:4078");
+	}
 }
