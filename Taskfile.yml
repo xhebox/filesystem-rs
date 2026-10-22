@@ -44,3 +44,13 @@ tasks:
           rm -f tmp/libjuicefs.h
           mv -f tmp/libjuicefs.a '{{.ARCHIVE}}'
         platforms: [darwin, windows]
+
+  generate:
+    desc: "Regenerate src/binding.rs from the Go archive's C header (needs bindgen and libclang)"
+    cmds:
+      - cmd: |
+          set -eu
+          mkdir -p tmp/generate
+          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/generate/libjuicefs.a' .)
+          rm -f tmp/generate/libjuicefs.a
+          bindgen tmp/generate/libjuicefs.h --allowlist-function 'juicefs_.*' --allowlist-type 'juicefs_.*' --with-derive-default --impl-debug --rust-target 1.85 --rust-edition 2024 -o crates/juicefs-rs/src/binding.rs

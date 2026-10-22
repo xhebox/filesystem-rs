@@ -10,8 +10,10 @@ publish = false
 [workspace.dependencies]
 fuse-api = { version = "0.1.0", path = "crates/fuse-api" }
 asyncband = { version = "0.7.3", features = ["oneshot"] }
+completion = { package = "completion-async", version = "0.2.0" }
 libc = "0.2"
 log = { version = "0.4.34", features = ["std", "kv"] }
+rustix = "1.1"
 
 # Every crate inherits lints with `[lints] workspace = true`.
 [workspace.lints.rust]

@@ -1,0 +1,18 @@
+[package]
+name = "localpath-rs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The back-end is Unix-only (see `lib.rs`), so its dependencies are too.
+[target.'cfg(unix)'.dependencies]
+completion = { workspace = true }
+fuse-api = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+[lints]
+workspace = true

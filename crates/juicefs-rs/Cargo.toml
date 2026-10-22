@@ -11,7 +11,6 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dependencies]
 asyncband = { workspace = true }
-fuse-api = { workspace = true }
 log = { workspace = true }
 
 [lints]

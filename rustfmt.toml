@@ -1,2 +1,4 @@
 hard_tabs = true
 style_edition = "2024"
+unstable_features = true
+ignore = ["crates/juicefs-rs/src/binding.rs"]

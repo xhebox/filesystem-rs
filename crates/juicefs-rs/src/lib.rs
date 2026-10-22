@@ -22,28 +22,24 @@
 //!
 //! Both are answered the same way: a session owns a pool of plain threads, and
 //! every call into Go happens on one of them. The pool is started by whoever
-//! calls [`Session::open`], which must be a thread no device filter has
+//! calls [`Volume::mount`], which must be a thread no device filter has
 //! reached — in the VMM, the monitor thread, before the run seals.
 //!
 //! A call is a closure: it runs on a pool thread with the session's handle,
 //! and its answer comes back through a oneshot channel. That is what lets the
-//! safe methods below be ordinary futures, and what keeps the owner of the
-//! guest memory (an `Arc<dyn Memory>`) alive for the whole of a blocking read
-//! or write even when the future that started it is dropped.
+//! methods below be ordinary futures, and what keeps a buffer alive for the
+//! whole of a blocking read or write even when the future that started it is
+//! dropped: the buffer moves into the closure with the call.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_longlong, c_void};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::io;
 use std::path::Path;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use asyncband::oneshot;
-
-mod juicefs;
-pub use juicefs::{Volume, reply_len};
 
 /// How many calls into Go run at once. The device serves every chain as its
 /// own task, so a handful in flight is what keeps a slow read from holding the
@@ -87,373 +83,25 @@ go_entry!("_rt0_amd64_windows_lib");
 #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
 go_entry!("_rt0_arm64_windows_lib");
 
-/// `struct fuse_attr`: one inode's attributes, in the layout the guest's
-/// kernel reads. The Go side fills it from the VFS's `meta.Attr`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Attr {
-	pub ino: u64,
-	pub size: u64,
-	pub blocks: u64,
-	pub atime: u64,
-	pub mtime: u64,
-	pub ctime: u64,
-	pub atimensec: u32,
-	pub mtimensec: u32,
-	pub ctimensec: u32,
-	pub mode: u32,
-	pub nlink: u32,
-	pub uid: u32,
-	pub gid: u32,
-	pub rdev: u32,
-	pub blksize: u32,
-	pub flags: u32,
-}
+#[allow(non_camel_case_types, non_snake_case, unreachable_pub, dead_code)]
+mod binding;
 
-/// A resolved name: the inode and its attributes.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Entry {
-	pub ino: u64,
-	pub attr: Attr,
-}
+// The C structures are `binding`'s, generated from the Go archive's header. The
+// names here are the ones the rest of the crate has always used.
+pub use binding::{
+	juicefs_attr as Attr, juicefs_ctx as Ctx, juicefs_dirent as Dirent, juicefs_entry as Entry,
+	juicefs_statvfs as Statfs,
+};
 
-/// The credentials a request carries, filled from the FUSE request header.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Ctx {
-	pub uid: u32,
-	pub gid: u32,
-	pub pid: u32,
-}
-
-/// One range of guest memory, as the C ABI takes it.
-///
-/// The pointer is only sent to the pool thread, which is what makes `read`
-/// and `write` unsafe: the caller owns the memory and keeps it alive, through
-/// the `owner` argument, for as long as the call runs.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct IoVec {
-	pub base: *mut c_void,
-	pub len: usize,
-}
-
-// SAFETY: the pointer names guest memory, not a Rust allocation, and a call
-// that carries one also carries an owner that keeps it alive until the pool
-// thread returns. The struct itself holds no ownership.
-unsafe impl Send for IoVec {}
-
-/// One directory record, as `readdir` reports it. The type tag is not here:
-/// it is `(attr.mode & S_IFMT) >> 12`, the kernel's own `DT_*` encoding.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct Dirent {
-	pub ino: u64,
-	pub attr: Attr,
-	pub namelen: u32,
-	pub name: [c_char; 256],
-}
-
-impl Default for Dirent {
-	fn default() -> Self {
-		Self {
-			ino: 0,
-			attr: Attr::default(),
-			namelen: 0,
-			name: [0; 256],
-		}
-	}
-}
-
-/// The `fuse_kstatfs` body a STATFS reply carries.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Statfs {
-	pub blocks: u64,
-	pub bfree: u64,
-	pub bavail: u64,
-	pub files: u64,
-	pub ffree: u64,
-	pub bsize: u32,
-	pub namelen: u32,
-	pub frsize: u32,
-}
-
-/// The value of a GETXATTR: the bytes, or the size a probe must supply.
-#[derive(Clone, Debug)]
-pub enum Xattr {
-	Value(Vec<u8>),
-	Size(u32),
-}
-
-/// The value of a LISTXATTR: the name list, or the size a probe must supply.
-#[derive(Clone, Debug)]
-pub enum ListXattr {
-	Names(Vec<u8>),
-	Size(u32),
-}
-
-mod ffi {
-	use super::{Attr, Ctx, Dirent, Entry, IoVec, Statfs};
-	use std::ffi::{c_char, c_int, c_longlong, c_void};
-
-	unsafe extern "C" {
-		/// Mounts one volume. 0 means failure, with `err` set to a message the
-		/// caller releases with `juicefs_free`; on success `err` is untouched.
-		pub(crate) fn juicefs_mount(
-			payload: *const c_char,
-			cache_dir: *const c_char,
-			attr_ttl_ms: c_longlong,
-			entry_ttl_ms: c_longlong,
-			err: *mut *mut c_char,
-		) -> usize;
-
-		pub(crate) fn juicefs_unmount(handle: usize);
-
-		/// Releases a message `juicefs_mount` returned.
-		pub(crate) fn juicefs_free(message: *mut c_char);
-
-		// Every operation returns 0 or a host errno; replies go through the
-		// out-parameter.
-		pub(crate) fn juicefs_lookup(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-			out: *mut Entry,
-		) -> c_int;
-		pub(crate) fn juicefs_getattr(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			opened: c_int,
-			out: *mut Attr,
-		) -> c_int;
-		#[allow(clippy::too_many_arguments)]
-		pub(crate) fn juicefs_setattr(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			valid: u32,
-			fh: u64,
-			mode: u32,
-			uid: u32,
-			gid: u32,
-			atime: i64,
-			mtime: i64,
-			atimensec: u32,
-			mtimensec: u32,
-			size: u64,
-			out: *mut Attr,
-		) -> c_int;
-		pub(crate) fn juicefs_readlink(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			buf: *mut c_char,
-			capacity: usize,
-			length: *mut usize,
-		) -> c_int;
-		pub(crate) fn juicefs_symlink(
-			handle: usize,
-			ctx: *const Ctx,
-			target: *const c_char,
-			parent: u64,
-			name: *const c_char,
-			out: *mut Entry,
-		) -> c_int;
-		pub(crate) fn juicefs_mknod(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-			mode: u32,
-			rdev: u32,
-			umask: u32,
-			out: *mut Entry,
-		) -> c_int;
-		pub(crate) fn juicefs_mkdir(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-			mode: u32,
-			umask: u32,
-			out: *mut Entry,
-		) -> c_int;
-		pub(crate) fn juicefs_unlink(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-		) -> c_int;
-		pub(crate) fn juicefs_rmdir(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-		) -> c_int;
-		pub(crate) fn juicefs_rename(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-			newparent: u64,
-			newname: *const c_char,
-			flags: u32,
-		) -> c_int;
-		pub(crate) fn juicefs_link(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			parent: u64,
-			name: *const c_char,
-			out: *mut Entry,
-		) -> c_int;
-		pub(crate) fn juicefs_open(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			flags: u32,
-			fh: *mut u64,
-			keep_cache: *mut c_int,
-		) -> c_int;
-		pub(crate) fn juicefs_create(
-			handle: usize,
-			ctx: *const Ctx,
-			parent: u64,
-			name: *const c_char,
-			mode: u32,
-			umask: u32,
-			flags: u32,
-			out: *mut Entry,
-			fh: *mut u64,
-			keep_cache: *mut c_int,
-		) -> c_int;
-		pub(crate) fn juicefs_read(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			offset: u64,
-			iov: *const IoVec,
-			iovcnt: usize,
-			n: *mut usize,
-		) -> c_int;
-		pub(crate) fn juicefs_write(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			offset: u64,
-			iov: *const IoVec,
-			iovcnt: usize,
-		) -> c_int;
-		pub(crate) fn juicefs_flush(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			lock_owner: u64,
-		) -> c_int;
-		pub(crate) fn juicefs_fsync(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			datasync: c_int,
-		) -> c_int;
-		pub(crate) fn juicefs_release(handle: usize, ctx: *const Ctx, ino: u64, fh: u64) -> c_int;
-		pub(crate) fn juicefs_fallocate(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			mode: u32,
-			offset: i64,
-			length: i64,
-		) -> c_int;
-		pub(crate) fn juicefs_statfs(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			out: *mut Statfs,
-		) -> c_int;
-		pub(crate) fn juicefs_access(handle: usize, ctx: *const Ctx, ino: u64, mask: u32) -> c_int;
-		pub(crate) fn juicefs_opendir(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			flags: u32,
-			fh: *mut u64,
-		) -> c_int;
-		#[allow(clippy::too_many_arguments)]
-		pub(crate) fn juicefs_readdir(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			offset: u64,
-			plus: c_int,
-			out: *mut Dirent,
-			capacity: usize,
-			count: *mut usize,
-			more: *mut c_int,
-		) -> c_int;
-		pub(crate) fn juicefs_readdir_offset(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-			offset: u64,
-		) -> c_int;
-		pub(crate) fn juicefs_releasedir(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			fh: u64,
-		) -> c_int;
-		pub(crate) fn juicefs_getxattr(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			name: *const c_char,
-			size: u32,
-			buf: *mut c_char,
-			capacity: usize,
-			length: *mut usize,
-		) -> c_int;
-		pub(crate) fn juicefs_listxattr(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			size: u32,
-			buf: *mut c_char,
-			capacity: usize,
-			length: *mut usize,
-		) -> c_int;
-		pub(crate) fn juicefs_setxattr(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			name: *const c_char,
-			value: *const c_void,
-			len: usize,
-			flags: u32,
-		) -> c_int;
-		pub(crate) fn juicefs_removexattr(
-			handle: usize,
-			ctx: *const Ctx,
-			ino: u64,
-			name: *const c_char,
-		) -> c_int;
-	}
+/// bindgen types every pointer argument `*mut`, because cgo's header has no `const`.
+/// Go only reads through the ones passed as `&T`, so the cast is all there is to it.
+fn mut_ptr<T>(value: &T) -> *mut T {
+	std::ptr::from_ref(value).cast_mut()
 }
 
 /// Starts the Go runtime, once per process, with this process's arguments.
 ///
-/// [`Session::open`] calls this itself, and *when* it does so is what makes
+/// [`Volume::mount`] calls this itself, and *when* it does so is what makes
 /// that work. Starting the runtime brings up the Go scheduler's threads and
 /// installs Go's own handling for `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGURG`,
 /// `SIGPIPE` and for `SIGINT`/`SIGTERM`, so it has to happen after whatever
@@ -462,7 +110,7 @@ mod ffi {
 /// runtime takes `SIGINT`/`SIGTERM` back and the process stops shutting down
 /// cleanly), and before any thread is confined (every thread the runtime goes
 /// on to start inherits the confinement of the one that started it). In the
-/// VMM those three sit either side of one call: `Session::open` runs while the
+/// VMM those three sit either side of one call: `Volume::mount` runs while the
 /// devices are being attached, which is after the sandbox is entered and
 /// before it is sealed, and well before the run installs its handlers.
 pub fn start_runtime() {
@@ -573,16 +221,11 @@ fn auxv() -> Vec<*mut c_char> {
 	Vec::new()
 }
 
-/// How much room a READLINK reply gets. Longer than any symlink target the
-/// VFS accepts, so a host `ERANGE` here means the guest named a target this
-/// side cannot express rather than a buffer that is simply too small.
-const READLINK_CAPACITY: usize = 4096;
-
 /// A mounted volume and the threads that serve it.
 ///
 /// Dropping it unmounts: the pool's threads see their queues close and end,
 /// and the Go-side session is released.
-pub struct Session {
+pub struct Volume {
 	handle: usize,
 	/// One queue per worker, and a cursor over them. A single shared queue
 	/// would have to be reached into exclusively by each worker, since the
@@ -591,27 +234,20 @@ pub struct Session {
 	queues: Vec<Sender<Job>>,
 	next: AtomicUsize,
 	workers: Vec<JoinHandle<()>>,
-	attr_ttl: Duration,
-	entry_ttl: Duration,
 }
 
 /// One call in flight: what to run with the session's handle, and the channel
 /// the worker answers on.
 type Job = Box<dyn FnOnce(usize) + Send>;
 
-impl Session {
+impl Volume {
 	/// Mounts the volume `meta_url` names, caching chunks under `cache_dir`.
 	///
 	/// Starts the Go runtime if this is the process's first volume, and the
 	/// pool with it, so it must run on a thread no device filter has reached
 	/// and at a point [`start_runtime`] describes — see this module's
 	/// documentation.
-	pub fn open(
-		meta_url: &str,
-		cache_dir: &Path,
-		attr_ttl: Duration,
-		entry_ttl: Duration,
-	) -> io::Result<Session> {
+	pub fn mount(meta_url: &str, cache_dir: &Path) -> io::Result<Volume> {
 		start_runtime();
 		let payload = CString::new(meta_url).map_err(|_| {
 			io::Error::new(io::ErrorKind::InvalidInput, "the metadata URL has a NUL")
@@ -619,15 +255,13 @@ impl Session {
 		let cache = CString::new(cache_dir.as_os_str().as_encoded_bytes())
 			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the cache path has a NUL"))?;
 
-		let mut error: *mut c_char = std::ptr::null_mut();
+		let mut error = 0usize;
 		// SAFETY: both arguments are valid NUL-terminated strings for the
 		// duration of the call, and `error` is a valid place to write one.
 		let handle = unsafe {
-			ffi::juicefs_mount(
-				payload.as_ptr(),
-				cache.as_ptr(),
-				attr_ttl.as_millis() as c_longlong,
-				entry_ttl.as_millis() as c_longlong,
+			binding::juicefs_mount(
+				payload.as_ptr().cast_mut(),
+				cache.as_ptr().cast_mut(),
 				&mut error,
 			)
 		};
@@ -656,7 +290,7 @@ impl Session {
 						drop(worker.join());
 					}
 					// SAFETY: nothing can call into the session again.
-					unsafe { ffi::juicefs_unmount(handle) };
+					unsafe { binding::juicefs_unmount(handle) };
 					return Err(io::Error::new(
 						error.kind(),
 						format!("spawn a juicefs worker: {error}"),
@@ -665,24 +299,12 @@ impl Session {
 			}
 		}
 
-		Ok(Session {
+		Ok(Volume {
 			handle,
 			queues,
 			next: AtomicUsize::new(0),
 			workers,
-			attr_ttl,
-			entry_ttl,
 		})
-	}
-
-	/// How long the guest may cache an inode's attributes.
-	pub fn attr_ttl(&self) -> Duration {
-		self.attr_ttl
-	}
-
-	/// How long the guest may cache a resolved name.
-	pub fn entry_ttl(&self) -> Duration {
-		self.entry_ttl
 	}
 
 	/// Runs `f` against the session's handle on a pool thread.
@@ -713,8 +335,15 @@ impl Session {
 			let mut out = Entry::default();
 			// SAFETY: `name` outlives the call, and `out` is a valid place for
 			// the Go side to write the entry.
-			let code =
-				unsafe { ffi::juicefs_lookup(handle, &ctx, parent, name.as_ptr(), &mut out) };
+			let code = unsafe {
+				binding::juicefs_lookup(
+					handle,
+					mut_ptr(&ctx),
+					parent,
+					name.as_ptr().cast_mut(),
+					&mut out,
+				)
+			};
 			check(code).map(|()| out)
 		})
 		.await
@@ -724,8 +353,9 @@ impl Session {
 		self.call(move |handle| {
 			let mut out = Attr::default();
 			// SAFETY: `out` is a valid place for the Go side to write the attr.
-			let code =
-				unsafe { ffi::juicefs_getattr(handle, &ctx, ino, c_int::from(opened), &mut out) };
+			let code = unsafe {
+				binding::juicefs_getattr(handle, mut_ptr(&ctx), ino, c_int::from(opened), &mut out)
+			};
 			check(code).map(|()| out)
 		})
 		.await
@@ -752,9 +382,21 @@ impl Session {
 			let mut out = Attr::default();
 			// SAFETY: `out` is a valid place for the Go side to write the attr.
 			let code = unsafe {
-				ffi::juicefs_setattr(
-					handle, &ctx, ino, valid, fh, mode, uid, gid, atime, mtime, atimensec,
-					mtimensec, size, &mut out,
+				binding::juicefs_setattr(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					valid,
+					fh,
+					mode,
+					uid,
+					gid,
+					atime,
+					mtime,
+					atimensec,
+					mtimensec,
+					size,
+					&mut out,
 				)
 			};
 			check(code).map(|()| out)
@@ -762,26 +404,13 @@ impl Session {
 		.await
 	}
 
+	/// Reads a symbolic link's target.
 	pub async fn readlink(&self, ctx: Ctx, ino: u64) -> io::Result<Vec<u8>> {
 		self.call(move |handle| {
-			let mut buf = vec![0u8; READLINK_CAPACITY];
-			let mut length = 0usize;
-			// SAFETY: `buf` is a valid buffer of `READLINK_CAPACITY` bytes, and
-			// `length` a valid place for the Go side to report what it used.
-			let code = unsafe {
-				ffi::juicefs_readlink(
-					handle,
-					&ctx,
-					ino,
-					buf.as_mut_ptr().cast(),
-					buf.len(),
-					&mut length,
-				)
-			};
-			check(code).map(|()| {
-				buf.truncate(length);
-				buf
-			})
+			let mut out = 0usize;
+			// SAFETY: `out` is a valid place for the Go side to write.
+			let code = unsafe { binding::juicefs_readlink(handle, mut_ptr(&ctx), ino, &mut out) };
+			take(code, out)
 		})
 		.await
 	}
@@ -800,12 +429,12 @@ impl Session {
 			// SAFETY: both strings outlive the call, and `out` is a valid place
 			// for the Go side to write the entry.
 			let code = unsafe {
-				ffi::juicefs_symlink(
+				binding::juicefs_symlink(
 					handle,
-					&ctx,
-					target.as_ptr(),
+					mut_ptr(&ctx),
+					target.as_ptr().cast_mut(),
 					parent,
-					name.as_ptr(),
+					name.as_ptr().cast_mut(),
 					&mut out,
 				)
 			};
@@ -829,11 +458,11 @@ impl Session {
 			// SAFETY: `name` outlives the call, and `out` is a valid place for
 			// the Go side to write the entry.
 			let code = unsafe {
-				ffi::juicefs_mknod(
+				binding::juicefs_mknod(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					parent,
-					name.as_ptr(),
+					name.as_ptr().cast_mut(),
 					mode,
 					rdev,
 					umask,
@@ -859,7 +488,15 @@ impl Session {
 			// SAFETY: `name` outlives the call, and `out` is a valid place for
 			// the Go side to write the entry.
 			let code = unsafe {
-				ffi::juicefs_mkdir(handle, &ctx, parent, name.as_ptr(), mode, umask, &mut out)
+				binding::juicefs_mkdir(
+					handle,
+					mut_ptr(&ctx),
+					parent,
+					name.as_ptr().cast_mut(),
+					mode,
+					umask,
+					&mut out,
+				)
 			};
 			check(code).map(|()| out)
 		})
@@ -870,7 +507,9 @@ impl Session {
 		let name = name.to_owned();
 		self.call(move |handle| {
 			// SAFETY: `name` outlives the call.
-			check(unsafe { ffi::juicefs_unlink(handle, &ctx, parent, name.as_ptr()) })
+			check(unsafe {
+				binding::juicefs_unlink(handle, mut_ptr(&ctx), parent, name.as_ptr().cast_mut())
+			})
 		})
 		.await
 	}
@@ -879,7 +518,9 @@ impl Session {
 		let name = name.to_owned();
 		self.call(move |handle| {
 			// SAFETY: `name` outlives the call.
-			check(unsafe { ffi::juicefs_rmdir(handle, &ctx, parent, name.as_ptr()) })
+			check(unsafe {
+				binding::juicefs_rmdir(handle, mut_ptr(&ctx), parent, name.as_ptr().cast_mut())
+			})
 		})
 		.await
 	}
@@ -898,13 +539,13 @@ impl Session {
 		self.call(move |handle| {
 			// SAFETY: both strings outlive the call.
 			check(unsafe {
-				ffi::juicefs_rename(
+				binding::juicefs_rename(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					parent,
-					name.as_ptr(),
+					name.as_ptr().cast_mut(),
 					newparent,
-					newname.as_ptr(),
+					newname.as_ptr().cast_mut(),
 					flags,
 				)
 			})
@@ -925,26 +566,30 @@ impl Session {
 			// SAFETY: `newname` outlives the call, and `out` is a valid place
 			// for the Go side to write the entry.
 			let code = unsafe {
-				ffi::juicefs_link(handle, &ctx, ino, newparent, newname.as_ptr(), &mut out)
+				binding::juicefs_link(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					newparent,
+					newname.as_ptr().cast_mut(),
+					&mut out,
+				)
 			};
 			check(code).map(|()| out)
 		})
 		.await
 	}
 
-	/// Opens a file, returning its handle and whether the guest may keep the
-	/// file's pages cached (`FOPEN_KEEP_CACHE`, as opposed to direct I/O).
-	///
-	/// Named `open_file` because [`Session::open`] is how the volume itself is
-	/// mounted.
-	pub async fn open_file(&self, ctx: Ctx, ino: u64, flags: u32) -> io::Result<(u64, bool)> {
+	/// Opens a file, returning the entry the VFS gives it and the handle.
+	pub async fn open(&self, ctx: Ctx, ino: u64, flags: u32) -> io::Result<(Entry, u64)> {
 		self.call(move |handle| {
+			let mut out = Entry::default();
 			let mut fh = 0u64;
-			let mut keep_cache = 0 as c_int;
 			// SAFETY: both out-parameters are valid for the Go side to write.
-			let code =
-				unsafe { ffi::juicefs_open(handle, &ctx, ino, flags, &mut fh, &mut keep_cache) };
-			check(code).map(|()| (fh, keep_cache != 0))
+			let code = unsafe {
+				binding::juicefs_open(handle, mut_ptr(&ctx), ino, flags, &mut out, &mut fh)
+			};
+			check(code).map(|()| (out, fh))
 		})
 		.await
 	}
@@ -957,107 +602,99 @@ impl Session {
 		mode: u32,
 		umask: u32,
 		flags: u32,
-	) -> io::Result<(Entry, u64, bool)> {
+	) -> io::Result<(Entry, u64)> {
 		let name = name.to_owned();
 		self.call(move |handle| {
 			let mut out = Entry::default();
 			let mut fh = 0u64;
-			let mut keep_cache = 0 as c_int;
 			// SAFETY: `name` outlives the call, and every out-parameter is a
 			// valid place for the Go side to write.
 			let code = unsafe {
-				ffi::juicefs_create(
+				binding::juicefs_create(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					parent,
-					name.as_ptr(),
+					name.as_ptr().cast_mut(),
 					mode,
 					umask,
 					flags,
 					&mut out,
 					&mut fh,
-					&mut keep_cache,
 				)
 			};
-			check(code).map(|()| (out, fh, keep_cache != 0))
+			check(code).map(|()| (out, fh))
 		})
 		.await
 	}
 
-	/// Reads into the ranges `iov` names.
-	///
-	/// # Safety
-	/// Every range must be valid for writes for the whole call, which is why
-	/// `owner` is taken: it is moved into the pool job and dropped only after
-	/// the blocking call returns, so the memory behind the ranges stays alive
-	/// even if this future is dropped first. `iov` itself is copied into the
-	/// job.
-	pub async unsafe fn read(
+	/// Reads up to `size` bytes at `offset`, as the VFS reads: the result holds the
+	/// bytes it filled, and no more.
+	pub async fn read(
 		&self,
 		ctx: Ctx,
 		ino: u64,
 		fh: u64,
 		offset: u64,
-		iov: &[IoVec],
-		owner: impl Send + 'static,
-	) -> io::Result<usize> {
-		let iov = iov.to_vec();
+		size: usize,
+	) -> io::Result<Vec<u8>> {
 		self.call(move |handle| {
+			let mut buf = vec![0u8; size];
 			let mut n = 0usize;
-			// SAFETY: the caller's contract makes every range writable for the
-			// whole call; `iov` lives in this closure and `n` is valid.
+			// SAFETY: `buf` is `size` writable bytes that live in this closure for the
+			// whole call, and `n` is a valid place for the Go side to write.
 			let code = unsafe {
-				ffi::juicefs_read(
+				binding::juicefs_read(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					ino,
 					fh,
 					offset,
-					iov.as_ptr(),
-					iov.len(),
+					buf.as_mut_ptr().cast(),
+					buf.len(),
 					&mut n,
 				)
 			};
-			drop(owner);
-			check(code).map(|()| n)
+			check(code).map(|()| {
+				buf.truncate(n.min(size));
+				buf
+			})
 		})
 		.await
 	}
 
-	/// Writes the bytes the ranges `iov` name.
-	///
-	/// # Safety
-	/// As for [`Session::read`]: every range must be valid for reads for the
-	/// whole call, and `owner` keeps the memory alive until the pool thread
-	/// returns.
-	pub async unsafe fn write(
+	/// Writes `buf` at `offset`, as the VFS writes it. The buffer moves into the
+	/// call, so the bytes stay valid until the Go side has copied them, even if
+	/// this future is dropped first.
+	pub async fn write(
 		&self,
 		ctx: Ctx,
 		ino: u64,
 		fh: u64,
 		offset: u64,
-		iov: &[IoVec],
-		owner: impl Send + 'static,
+		buf: Vec<u8>,
 	) -> io::Result<()> {
-		let iov = iov.to_vec();
 		self.call(move |handle| {
-			// SAFETY: the caller's contract makes every range readable for the
-			// whole call; `iov` lives in this closure.
-			let code = unsafe {
-				ffi::juicefs_write(handle, &ctx, ino, fh, offset, iov.as_ptr(), iov.len())
-			};
-			drop(owner);
-			check(code)
+			// SAFETY: `buf` lives in this closure for the whole call, and Go only reads it.
+			check(unsafe {
+				binding::juicefs_write(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					fh,
+					offset,
+					buf.as_ptr().cast::<c_char>().cast_mut(),
+					buf.len(),
+				)
+			})
 		})
 		.await
 	}
 
-	/// `lock_owner` is the FUSE flush owner; the front-end does not carry one,
-	/// so it is passed as zero.
+	/// `lock_owner` is the lock owner the VFS releases on flush; zero means none.
 	pub async fn flush(&self, ctx: Ctx, ino: u64, fh: u64, lock_owner: u64) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_flush(handle, &ctx, ino, fh, lock_owner) })
+			check(unsafe { binding::juicefs_flush(handle, mut_ptr(&ctx), ino, fh, lock_owner) })
 		})
 		.await
 	}
@@ -1065,7 +702,9 @@ impl Session {
 	pub async fn fsync(&self, ctx: Ctx, ino: u64, fh: u64, datasync: bool) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_fsync(handle, &ctx, ino, fh, c_int::from(datasync)) })
+			check(unsafe {
+				binding::juicefs_fsync(handle, mut_ptr(&ctx), ino, fh, c_int::from(datasync))
+			})
 		})
 		.await
 	}
@@ -1073,7 +712,7 @@ impl Session {
 	pub async fn release(&self, ctx: Ctx, ino: u64, fh: u64) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_release(handle, &ctx, ino, fh) })
+			check(unsafe { binding::juicefs_release(handle, mut_ptr(&ctx), ino, fh) })
 		})
 		.await
 	}
@@ -1083,13 +722,15 @@ impl Session {
 		ctx: Ctx,
 		ino: u64,
 		fh: u64,
-		mode: u32,
+		mode: u8,
 		offset: i64,
 		length: i64,
 	) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_fallocate(handle, &ctx, ino, fh, mode, offset, length) })
+			check(unsafe {
+				binding::juicefs_fallocate(handle, mut_ptr(&ctx), ino, fh, mode, offset, length)
+			})
 		})
 		.await
 	}
@@ -1098,7 +739,7 @@ impl Session {
 		self.call(move |handle| {
 			let mut out = Statfs::default();
 			// SAFETY: `out` is a valid place for the Go side to write.
-			let code = unsafe { ffi::juicefs_statfs(handle, &ctx, ino, &mut out) };
+			let code = unsafe { binding::juicefs_statfs(handle, mut_ptr(&ctx), ino, &mut out) };
 			check(code).map(|()| out)
 		})
 		.await
@@ -1107,7 +748,7 @@ impl Session {
 	pub async fn access(&self, ctx: Ctx, ino: u64, mask: u32) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_access(handle, &ctx, ino, mask) })
+			check(unsafe { binding::juicefs_access(handle, mut_ptr(&ctx), ino, mask) })
 		})
 		.await
 	}
@@ -1116,59 +757,75 @@ impl Session {
 		self.call(move |handle| {
 			let mut fh = 0u64;
 			// SAFETY: `fh` is a valid place for the Go side to write.
-			let code = unsafe { ffi::juicefs_opendir(handle, &ctx, ino, flags, &mut fh) };
+			let code =
+				unsafe { binding::juicefs_opendir(handle, mut_ptr(&ctx), ino, flags, &mut fh) };
 			check(code).map(|()| fh)
 		})
 		.await
 	}
 
-	/// Fetches at most `capacity` directory records from `offset`. The second
-	/// value is whether the VFS had more entries than fit, so the caller knows
-	/// to save its position.
+	/// Lists a directory from `offset`, as the VFS does: `size` is the VFS's size
+	/// argument and `plus` asks for current attributes. The second value is the
+	/// time the VFS read the directory, in Unix nanoseconds.
 	pub async fn readdir(
 		&self,
 		ctx: Ctx,
 		ino: u64,
 		fh: u64,
 		offset: u64,
+		size: u32,
 		plus: bool,
-		capacity: usize,
-	) -> io::Result<(Vec<Dirent>, bool)> {
+	) -> io::Result<(Vec<DirEntry>, i64)> {
 		self.call(move |handle| {
-			let mut out = vec![Dirent::default(); capacity];
+			let mut list = 0usize;
 			let mut count = 0usize;
-			let mut more = 0 as c_int;
-			// SAFETY: `out` names `capacity` writable records (a dangling
-			// pointer when it is empty, which the Go side never dereferences),
-			// and `count`/`more` are valid places to write.
+			let mut read_at = 0i64;
+			// SAFETY: `list`, `count` and `read_at` are valid places for the Go side to write.
 			let code = unsafe {
-				ffi::juicefs_readdir(
+				binding::juicefs_readdir(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					ino,
 					fh,
 					offset,
+					size,
 					c_int::from(plus),
-					out.as_mut_ptr(),
-					out.len(),
+					&mut list,
 					&mut count,
-					&mut more,
+					&mut read_at,
 				)
 			};
-			check(code).map(|()| {
-				out.truncate(count.min(out.len()));
-				(out, more != 0)
-			})
+			check(code)?;
+			// Every record is copied out before the list is released, on every path.
+			let entries = (0..count)
+				.map(|index| {
+					let mut record = Dirent::default();
+					// SAFETY: `list` holds `count` records, and `record` is a valid place for one.
+					check(unsafe { binding::juicefs_dirent_at(list, index, &mut record) })
+						.map(|()| dir_entry(&record))
+				})
+				.collect::<io::Result<Vec<_>>>();
+			// SAFETY: `list` is the handle the call returned, released once.
+			unsafe { binding::juicefs_dirents_free(list) };
+			Ok((entries?, read_at))
 		})
 		.await
 	}
 
-	/// Tells the directory handle where the client stopped after a reply buffer
-	/// filled before the batch did.
-	pub async fn readdir_offset(&self, ctx: Ctx, ino: u64, fh: u64, offset: u64) -> io::Result<()> {
+	/// Records where a directory handle's reader stopped, so that the next read
+	/// from `offset` resumes there.
+	pub async fn update_readdir_offset(
+		&self,
+		ctx: Ctx,
+		ino: u64,
+		fh: u64,
+		offset: u64,
+	) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_readdir_offset(handle, &ctx, ino, fh, offset) })
+			check(unsafe {
+				binding::juicefs_update_readdir_offset(handle, mut_ptr(&ctx), ino, fh, offset)
+			})
 		})
 		.await
 	}
@@ -1176,92 +833,47 @@ impl Session {
 	pub async fn releasedir(&self, ctx: Ctx, ino: u64, fh: u64) -> io::Result<()> {
 		self.call(move |handle| {
 			// SAFETY: every argument is a plain value.
-			check(unsafe { ffi::juicefs_releasedir(handle, &ctx, ino, fh) })
+			check(unsafe { binding::juicefs_releasedir(handle, mut_ptr(&ctx), ino, fh) })
 		})
 		.await
 	}
 
-	pub async fn getxattr(&self, ctx: Ctx, ino: u64, name: &CStr, size: u32) -> io::Result<Xattr> {
+	/// Reads one extended attribute's value.
+	pub async fn getxattr(
+		&self,
+		ctx: Ctx,
+		ino: u64,
+		name: &CStr,
+		size: u32,
+	) -> io::Result<Vec<u8>> {
 		let name = name.to_owned();
 		self.call(move |handle| {
-			if size == 0 {
-				let mut length = 0usize;
-				// SAFETY: this is the kernel's size probe: no buffer is passed,
-				// and `length` is a valid place for the Go side to write.
-				let code = unsafe {
-					ffi::juicefs_getxattr(
-						handle,
-						&ctx,
-						ino,
-						name.as_ptr(),
-						0,
-						std::ptr::null_mut(),
-						0,
-						&mut length,
-					)
-				};
-				return check(code).map(|()| Xattr::Size(length as u32));
-			}
-			let mut buf = vec![0u8; size as usize];
-			let mut length = 0usize;
-			// SAFETY: `buf` is `size` writable bytes and `length` is valid.
+			let mut out = 0usize;
+			// SAFETY: `name` outlives the call, and `out` is a valid place for the
+			// Go side to write.
 			let code = unsafe {
-				ffi::juicefs_getxattr(
+				binding::juicefs_getxattr(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					ino,
-					name.as_ptr(),
+					name.as_ptr().cast_mut(),
 					size,
-					buf.as_mut_ptr().cast(),
-					buf.len(),
-					&mut length,
+					&mut out,
 				)
 			};
-			check(code).map(|()| {
-				buf.truncate(length.min(buf.len()));
-				Xattr::Value(buf)
-			})
+			take(code, out)
 		})
 		.await
 	}
 
-	pub async fn listxattr(&self, ctx: Ctx, ino: u64, size: u32) -> io::Result<ListXattr> {
+	/// Lists the names of a file's extended attributes.
+	pub async fn listxattr(&self, ctx: Ctx, ino: u64, size: u32) -> io::Result<Vec<u8>> {
 		self.call(move |handle| {
-			if size == 0 {
-				let mut length = 0usize;
-				// SAFETY: this is the kernel's size probe: no buffer is passed,
-				// and `length` is a valid place for the Go side to write.
-				let code = unsafe {
-					ffi::juicefs_listxattr(
-						handle,
-						&ctx,
-						ino,
-						0,
-						std::ptr::null_mut(),
-						0,
-						&mut length,
-					)
-				};
-				return check(code).map(|()| ListXattr::Size(length as u32));
-			}
-			let mut buf = vec![0u8; size as usize];
-			let mut length = 0usize;
-			// SAFETY: `buf` is `size` writable bytes and `length` is valid.
-			let code = unsafe {
-				ffi::juicefs_listxattr(
-					handle,
-					&ctx,
-					ino,
-					size,
-					buf.as_mut_ptr().cast(),
-					buf.len(),
-					&mut length,
-				)
-			};
-			check(code).map(|()| {
-				buf.truncate(length.min(buf.len()));
-				ListXattr::Names(buf)
-			})
+			let mut out = 0usize;
+			// SAFETY: `out` is a valid place for the Go side to write.
+			let code =
+				unsafe { binding::juicefs_listxattr(handle, mut_ptr(&ctx), ino, size, &mut out) };
+			take(code, out)
 		})
 		.await
 	}
@@ -1281,12 +893,12 @@ impl Session {
 		self.call(move |handle| {
 			// SAFETY: `name` and `value` live in this closure for the call.
 			check(unsafe {
-				ffi::juicefs_setxattr(
+				binding::juicefs_setxattr(
 					handle,
-					&ctx,
+					mut_ptr(&ctx),
 					ino,
-					name.as_ptr(),
-					value.as_ptr().cast(),
+					name.as_ptr().cast_mut(),
+					value.as_ptr().cast_mut().cast(),
 					value.len(),
 					flags,
 				)
@@ -1299,13 +911,253 @@ impl Session {
 		let name = name.to_owned();
 		self.call(move |handle| {
 			// SAFETY: `name` outlives the call.
-			check(unsafe { ffi::juicefs_removexattr(handle, &ctx, ino, name.as_ptr()) })
+			check(unsafe {
+				binding::juicefs_removexattr(handle, mut_ptr(&ctx), ino, name.as_ptr().cast_mut())
+			})
+		})
+		.await
+	}
+
+	/// Sets a file's length, and returns the attributes the VFS reports after it.
+	pub async fn truncate(&self, ctx: Ctx, ino: u64, size: i64, fh: u64) -> io::Result<Attr> {
+		self.call(move |handle| {
+			let mut out = Attr::default();
+			// SAFETY: `out` is a valid place for the Go side to write.
+			let code = unsafe {
+				binding::juicefs_truncate(handle, mut_ptr(&ctx), ino, size, fh, &mut out)
+			};
+			check(code).map(|()| out)
+		})
+		.await
+	}
+
+	/// Copies `size` bytes from one open file to another, and reports how many
+	/// were copied.
+	pub async fn copy_file_range(
+		&self,
+		ctx: Ctx,
+		ino_in: u64,
+		fh_in: u64,
+		off_in: u64,
+		ino_out: u64,
+		fh_out: u64,
+		off_out: u64,
+		size: u64,
+		flags: u32,
+	) -> io::Result<u64> {
+		self.call(move |handle| {
+			let mut copied = 0u64;
+			// SAFETY: `copied` is a valid place for the Go side to write.
+			let code = unsafe {
+				binding::juicefs_copy_file_range(
+					handle,
+					mut_ptr(&ctx),
+					ino_in,
+					fh_in,
+					off_in,
+					ino_out,
+					fh_out,
+					off_out,
+					size,
+					flags,
+					&mut copied,
+				)
+			};
+			check(code).map(|()| copied)
+		})
+		.await
+	}
+
+	/// Writes out the buffered data under `path`.
+	pub async fn flush_all(&self, path: &CStr) -> io::Result<()> {
+		let path = path.to_owned();
+		self.call(move |handle| {
+			let mut message = 0usize;
+			// SAFETY: `path` outlives the call, and `message` is a valid place for
+			// the Go side to write a failure's message.
+			let code = unsafe {
+				binding::juicefs_flush_all(handle, path.as_ptr().cast_mut(), &mut message)
+			};
+			if code == 0 {
+				return Ok(());
+			}
+			Err(io::Error::other(
+				String::from_utf8_lossy(&take_bytes(message)).into_owned(),
+			))
+		})
+		.await
+	}
+
+	/// Whether `ino` has changed since `start`, given in Unix nanoseconds.
+	pub async fn modified_since(&self, ino: u64, start: i64) -> io::Result<bool> {
+		self.call(move |handle| {
+			// SAFETY: every argument is a plain value.
+			Ok(unsafe { binding::juicefs_modified_since(handle, ino, start) } != 0)
+		})
+		.await
+	}
+
+	/// Drops one open handle's state in the VFS.
+	pub async fn release_handler(&self, ino: u64, fh: u64) -> io::Result<()> {
+		self.call(move |handle| {
+			// SAFETY: every argument is a plain value.
+			unsafe { binding::juicefs_release_handler(handle, ino, fh) };
+			Ok(())
+		})
+		.await
+	}
+
+	/// Refreshes a file's length from the chunk store, as the VFS does before it
+	/// caches an attribute, and returns the length it settles on.
+	pub async fn update_length(
+		&self,
+		ino: u64,
+		full: bool,
+		typ: u8,
+		length: u64,
+	) -> io::Result<u64> {
+		self.call(move |handle| {
+			let mut length = length;
+			// SAFETY: `length` is a valid place for the Go side to read and write.
+			unsafe {
+				binding::juicefs_update_length(handle, ino, c_int::from(full), typ, &mut length)
+			};
+			Ok(length)
+		})
+		.await
+	}
+
+	/// Tests for a POSIX lock that conflicts with the described range. Returns the
+	/// conflicting lock's `(start, len, typ, pid)`, or the query unchanged if none
+	/// conflicts.
+	pub async fn getlk(
+		&self,
+		ctx: Ctx,
+		ino: u64,
+		fh: u64,
+		owner: u64,
+		start: u64,
+		len: u64,
+		typ: u32,
+		pid: u32,
+	) -> io::Result<(u64, u64, u32, u32)> {
+		self.call(move |handle| {
+			let (mut start, mut len, mut typ, mut pid) = (start, len, typ, pid);
+			// SAFETY: every out-parameter is a valid place for the Go side to read and write.
+			let code = unsafe {
+				binding::juicefs_getlk(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					fh,
+					owner,
+					&mut start,
+					&mut len,
+					&mut typ,
+					&mut pid,
+				)
+			};
+			check(code).map(|()| (start, len, typ, pid))
+		})
+		.await
+	}
+
+	/// Takes or releases a POSIX lock over `start..end`; `block` waits for a
+	/// conflict to clear.
+	pub async fn setlk(
+		&self,
+		ctx: Ctx,
+		ino: u64,
+		fh: u64,
+		owner: u64,
+		start: u64,
+		end: u64,
+		typ: u32,
+		pid: u32,
+		block: bool,
+	) -> io::Result<()> {
+		self.call(move |handle| {
+			// SAFETY: every argument is a plain value.
+			check(unsafe {
+				binding::juicefs_setlk(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					fh,
+					owner,
+					start,
+					end,
+					typ,
+					pid,
+					c_int::from(block),
+				)
+			})
+		})
+		.await
+	}
+
+	/// Takes or releases a BSD lock on the whole file; `block` waits for a conflict.
+	pub async fn flock(
+		&self,
+		ctx: Ctx,
+		ino: u64,
+		fh: u64,
+		owner: u64,
+		typ: u32,
+		block: bool,
+	) -> io::Result<()> {
+		self.call(move |handle| {
+			// SAFETY: every argument is a plain value.
+			check(unsafe {
+				binding::juicefs_flock(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					fh,
+					owner,
+					typ,
+					c_int::from(block),
+				)
+			})
+		})
+		.await
+	}
+
+	/// Runs one ioctl. `input` goes to the VFS as it is, and the reply is the
+	/// `output_len` bytes the VFS fills in.
+	pub async fn ioctl(
+		&self,
+		ctx: Ctx,
+		ino: u64,
+		cmd: u32,
+		arg: u64,
+		input: Vec<u8>,
+		output_len: usize,
+	) -> io::Result<Vec<u8>> {
+		self.call(move |handle| {
+			let mut output = vec![0u8; output_len];
+			// SAFETY: `input` and `output` live in this closure for the whole call,
+			// and the lengths passed are their own.
+			let code = unsafe {
+				binding::juicefs_ioctl(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					cmd,
+					arg,
+					input.as_ptr().cast_mut().cast(),
+					input.len(),
+					output.as_mut_ptr().cast(),
+					output.len(),
+				)
+			};
+			check(code).map(|()| output)
 		})
 		.await
 	}
 }
 
-impl Drop for Session {
+impl Drop for Volume {
 	fn drop(&mut self) {
 		// Close the queues first, so the workers end rather than wait for more
 		// work; then the Go side's session goes, with nothing able to reach it.
@@ -1316,25 +1168,67 @@ impl Drop for Session {
 			}
 		}
 		// SAFETY: the pool is joined, so no call can be in flight.
-		unsafe { ffi::juicefs_unmount(self.handle) };
+		unsafe { binding::juicefs_unmount(self.handle) };
 	}
 }
 
-/// Takes the message `juicefs_mount` wrote into `error`, and releases it.
-fn mount_error(error: *mut c_char) -> io::Error {
-	if error.is_null() {
+/// Turns the message `juicefs_mount` returned into an error. A failed mount
+/// always returns one, so the fallback is only for a Go side that did not.
+fn mount_error(message: usize) -> io::Error {
+	if message == 0 {
 		return io::Error::other("mounting the JuiceFS volume failed");
 	}
-	// SAFETY: the Go side hands over a NUL-terminated message it allocated,
-	// which `juicefs_free` is the matching release for.
-	let message = unsafe { CStr::from_ptr(error) }
-		.to_string_lossy()
-		.into_owned();
-	unsafe { ffi::juicefs_free(error) };
-	io::Error::other(message)
+	io::Error::other(String::from_utf8_lossy(&take_bytes(message)).into_owned())
 }
 
-/// A host errno as an `io::Error`; the FUSE server translates it for the guest.
+/// Takes the bytes of a successful reply and releases the handle. A failed call
+/// returned no handle, so only the status is looked at first.
+fn take(code: c_int, bytes: usize) -> io::Result<Vec<u8>> {
+	check(code)?;
+	Ok(take_bytes(bytes))
+}
+
+/// Copies the bytes a bytes handle holds out into a `Vec`, and releases the
+/// handle. The length is read first, so the copy is exactly what the Go side has.
+fn take_bytes(handle: usize) -> Vec<u8> {
+	// SAFETY: `handle` is a live bytes handle from the Go side, and it is released
+	// below, once.
+	let len = unsafe { binding::juicefs_bytes_len(handle) };
+	let mut out = vec![0u8; len];
+	// SAFETY: `out` holds `len` writable bytes, which is what the Go side copies into.
+	unsafe { binding::juicefs_bytes_copy(handle, out.as_mut_ptr().cast(), len) };
+	// SAFETY: `handle` is the one released here, and it is not used after this.
+	unsafe { binding::juicefs_bytes_free(handle) };
+	out
+}
+
+/// One directory entry as the VFS holds it: the name is the bytes the VFS has,
+/// and the attributes travel with it.
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+	pub ino: u64,
+	pub attr: Attr,
+	pub name: Vec<u8>,
+}
+
+fn dir_entry(record: &Dirent) -> DirEntry {
+	DirEntry {
+		ino: record.ino,
+		attr: record.attr,
+		name: name_bytes(record),
+	}
+}
+
+/// The record's name bytes, cut at the array's bound.
+fn name_bytes(record: &Dirent) -> Vec<u8> {
+	let len = (record.namelen as usize).min(record.name.len());
+	record.name[..len]
+		.iter()
+		.map(|byte| byte.to_ne_bytes()[0])
+		.collect()
+}
+
+/// A host errno as an/// A host errno as an `io::Error`; the FUSE server translates it for the guest.
 fn check(code: c_int) -> io::Result<()> {
 	if code == 0 {
 		Ok(())
@@ -1348,5 +1242,26 @@ fn check(code: c_int) -> io::Result<()> {
 fn serve(handle: usize, jobs: Receiver<Job>) {
 	for job in jobs {
 		job(handle);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Names are copied out byte for byte, and a name that would overrun the
+	/// record is cut at the array's bound.
+	#[test]
+	fn names_are_bytes_not_text() {
+		let mut record = Dirent {
+			namelen: 3,
+			..Dirent::default()
+		};
+		for (slot, byte) in record.name.iter_mut().zip(b"a\xffz") {
+			*slot = *byte as c_char;
+		}
+		assert_eq!(name_bytes(&record), b"a\xffz");
+		record.namelen = u32::MAX;
+		assert_eq!(name_bytes(&record).len(), record.name.len());
 	}
 }

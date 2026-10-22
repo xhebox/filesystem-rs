@@ -51,46 +51,32 @@ fn main() -> io::Result<()> {
 	println!("the Go runtime started");
 
 	let Some(meta) = argument else {
-		match juicefs_rs::Session::open(
-			"sqlite3:///nonexistent/volume.db",
-			cache,
-			std::time::Duration::from_secs(1),
-			std::time::Duration::from_secs(1),
-		) {
+		match juicefs_rs::Volume::mount("sqlite3:///nonexistent/volume.db", cache) {
 			Ok(_) => println!("a volume that cannot exist mounted: wrong"),
 			Err(error) => println!("mount refused, as it should be: {error}"),
 		}
 		return Ok(());
 	};
 
-	let volume = juicefs_rs::Session::open(
-		&meta,
-		cache,
-		std::time::Duration::from_secs(1),
-		std::time::Duration::from_secs(1),
-	)?;
+	let volume = juicefs_rs::Volume::mount(&meta, cache)?;
 	println!("mounted");
 
 	let ctx = juicefs_rs::Ctx::default();
 	let root = block_on(volume.getattr(ctx, 1, false))?;
 	println!(
-		"GETATTR root: mode={:o} nlink={} uid={} gid={} blksize={}",
-		root.mode, root.nlink, root.uid, root.gid, root.blksize
+		"GETATTR root: typ={} mode={:o} nlink={} uid={} gid={}",
+		root.typ, root.mode, root.nlink, root.uid, root.gid
 	);
-	assert_eq!(root.ino, 1, "the root's attributes are the root's");
+	assert_eq!(root.typ, 2, "the root is a directory (meta.TypeDirectory)");
 
 	let statfs = block_on(volume.statfs(ctx, 1))?;
 	println!(
-		"STATFS: blocks={} bfree={} bavail={} files={} ffree={} bsize={} namelen={}",
-		statfs.blocks,
-		statfs.bfree,
-		statfs.bavail,
-		statfs.files,
-		statfs.ffree,
-		statfs.bsize,
-		statfs.namelen
+		"STATFS: total={} avail={} files={} favail={}",
+		statfs.total, statfs.avail, statfs.files, statfs.favail
 	);
-	assert_eq!(statfs.bsize, 4096);
-	assert_eq!(statfs.namelen, 255);
+	assert!(
+		statfs.avail <= statfs.total,
+		"the VFS never has more free than the total"
+	);
 	Ok(())
 }

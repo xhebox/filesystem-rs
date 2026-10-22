@@ -30,7 +30,7 @@ func main() {}
 
 // buildVFS replicates the essential stage-3 mount flow of upstream
 // cmd/mount.go: meta client, object storage, cached chunk store, VFS.
-func buildVFS(payload string, attrTTL, entryTTL time.Duration, cacheDir string) (*vfs.VFS, error) {
+func buildVFS(payload string, cacheDir string) (*vfs.VFS, error) {
 	metaConf := meta.DefaultConf()
 	metaConf.NoBGJob = true
 	metaConf.MountPoint = "/jfs" // log wording only; nothing is mounted
@@ -93,13 +93,10 @@ func buildVFS(payload string, attrTTL, entryTTL time.Duration, cacheDir string) 
 	})
 
 	vfsConf := &vfs.Config{
-		Meta:            metaConf,
-		Format:          *format,
-		Chunk:           chunkConf,
-		Version:         "juicefs",
-		AttrTimeout:     attrTTL,
-		EntryTimeout:    entryTTL,
-		DirEntryTimeout: entryTTL,
+		Meta:    metaConf,
+		Format:  *format,
+		Chunk:   chunkConf,
+		Version: "juicefs",
 	}
 	return vfs.NewVFS(vfsConf, metaCli, store, registry, registry), nil
 }
