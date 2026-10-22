@@ -47,7 +47,7 @@ tasks:
           # the archive's objects with `ld -r`, and localize every non-`juicefs_*`
           # symbol so the C/cgo internals cannot collide with another archive.
           if [ '{{OS}}' = darwin ]; then
-            entry="__rt0_$(go env GOARCH)_darwin_lib"
+            entry="__rt0_{{ARCH}}_darwin_lib"
             # Rustup's llvm-tools puts llvm-objcopy beside the target libraries.
             objcopy=llvm-objcopy
             command -v llvm-objcopy >/dev/null 2>&1 || objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
@@ -56,17 +56,19 @@ tasks:
               --globalize-symbol=_juicefs_rt0 \
               --redefine-sym "$entry=_juicefs_rt0" \
               tmp/libjuicefs.a
-            ld -r -arch "$(uname -m)" -all_load tmp/libjuicefs.a -o tmp/juicefs.o
+            cc -r -nostdlib -Wl,-all_load tmp/libjuicefs.a -o tmp/juicefs.o
             "$objcopy" --strip-debug --wildcard --keep-global-symbol='_juicefs_*' tmp/juicefs.o
           else
-            entry="_rt0_$(go env GOARCH)_windows_lib"
+            entry="_rt0_{{ARCH}}_windows_lib"
             objcopy --remove-section=.ctors \
               --redefine-sym "$entry=juicefs_rt0" \
               tmp/libjuicefs.a
             # MinGW's gcc emits calls to `___chkstk_ms` from `libgcc.a`; pulling
             # it into `juicefs.o` here resolves it before MSVC's `link.exe` runs.
+            libgcc="$(gcc -print-libgcc-file-name)"
+            libgcc="${libgcc%"$(printf '\r')"}"
             ld -r -dc --whole-archive tmp/libjuicefs.a \
-              --no-whole-archive "$(gcc -print-libgcc-file-name)" \
+              --no-whole-archive "$libgcc" \
               -o tmp/juicefs.o
             objcopy --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
           fi
