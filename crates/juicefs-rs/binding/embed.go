@@ -216,7 +216,7 @@ func juicefs_setattr(h C.uintptr_t, ctx *C.juicefs_ctx, ino C.uint64_t, valid C.
 	mode, uid, gid C.uint32_t, atime, mtime C.int64_t, atimensec, mtimensec C.uint32_t,
 	size C.uint64_t, out *C.juicefs_attr) C.int {
 	return guard(h, func(s *session) C.int {
-		e, err := s.v.SetAttr(s.context(ctx), meta.Ino(ino), int(valid), uint64(fh),
+		e, err := opSetAttr(s.v, s.context(ctx), meta.Ino(ino), int(valid), uint64(fh),
 			uint32(mode), uint32(uid), uint32(gid),
 			int64(atime), int64(mtime), uint32(atimensec), uint32(mtimensec), uint64(size))
 		if err != 0 {
@@ -389,15 +389,15 @@ func juicefs_fallocate(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh C.uint64_t, mo
 //export juicefs_statfs
 func juicefs_statfs(h C.uintptr_t, ctx *C.juicefs_ctx, ino C.uint64_t, out *C.juicefs_statvfs) C.int {
 	return guard(h, func(s *session) C.int {
-		st, err := s.v.StatFS(s.context(ctx), meta.Ino(ino))
+		total, avail, files, favail, err := opStatFS(s.v, s.context(ctx), meta.Ino(ino))
 		if err != 0 {
 			return C.int(err)
 		}
 		*out = C.juicefs_statvfs{
-			total:  C.uint64_t(st.Total),
-			avail:  C.uint64_t(st.Avail),
-			files:  C.uint64_t(st.Files),
-			favail: C.uint64_t(st.Favail),
+			total:  C.uint64_t(total),
+			avail:  C.uint64_t(avail),
+			files:  C.uint64_t(files),
+			favail: C.uint64_t(favail),
 		}
 		return 0
 	})
@@ -406,7 +406,7 @@ func juicefs_statfs(h C.uintptr_t, ctx *C.juicefs_ctx, ino C.uint64_t, out *C.ju
 //export juicefs_access
 func juicefs_access(h C.uintptr_t, ctx *C.juicefs_ctx, ino C.uint64_t, mask C.uint32_t) C.int {
 	return guard(h, func(s *session) C.int {
-		return C.int(s.v.Access(s.context(ctx), meta.Ino(ino), int(mask)))
+		return C.int(opAccess(s.v, s.context(ctx), meta.Ino(ino), int(mask)))
 	})
 }
 
@@ -546,7 +546,7 @@ func juicefs_update_length(h C.uintptr_t, ino C.uint64_t, full C.int, typ C.uint
 //export juicefs_getlk
 func juicefs_getlk(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh, owner C.uint64_t, start, length *C.uint64_t, typ, pid *C.uint32_t) C.int {
 	return guard(h, func(s *session) C.int {
-		return C.int(s.v.Getlk(s.context(ctx), meta.Ino(ino), uint64(fh), uint64(owner),
+		return C.int(opGetlk(s.v, s.context(ctx), meta.Ino(ino), uint64(fh), uint64(owner),
 			(*uint64)(unsafe.Pointer(start)), (*uint64)(unsafe.Pointer(length)),
 			(*uint32)(unsafe.Pointer(typ)), (*uint32)(unsafe.Pointer(pid))))
 	})
@@ -557,7 +557,7 @@ func juicefs_getlk(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh, owner C.uint64_t,
 //export juicefs_setlk
 func juicefs_setlk(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh, owner, start, end C.uint64_t, typ, pid C.uint32_t, block C.int) C.int {
 	return guard(h, func(s *session) C.int {
-		return C.int(s.v.Setlk(s.context(ctx), meta.Ino(ino), uint64(fh), uint64(owner),
+		return C.int(opSetlk(s.v, s.context(ctx), meta.Ino(ino), uint64(fh), uint64(owner),
 			uint64(start), uint64(end), uint32(typ), uint32(pid), block != 0))
 	})
 }
@@ -568,7 +568,7 @@ func juicefs_setlk(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh, owner, start, end
 //export juicefs_flock
 func juicefs_flock(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh, owner C.uint64_t, typ C.uint32_t, block C.int) C.int {
 	return guard(h, func(s *session) C.int {
-		return C.int(s.v.Flock(s.context(ctx), meta.Ino(ino), uint64(fh), uint64(owner), uint32(typ), block != 0))
+		return C.int(opFlock(s.v, s.context(ctx), meta.Ino(ino), uint64(fh), uint64(owner), uint32(typ), block != 0))
 	})
 }
 
@@ -586,7 +586,7 @@ func juicefs_ioctl(h C.uintptr_t, ctx *C.juicefs_ctx, ino C.uint64_t, cmd C.uint
 		if outLen > 0 {
 			bufOut = unsafe.Slice((*byte)(out), int(outLen))
 		}
-		return C.int(s.v.Ioctl(s.context(ctx), meta.Ino(ino), uint32(cmd), uint64(arg), bufIn, bufOut))
+		return C.int(opIoctl(s.v, s.context(ctx), meta.Ino(ino), uint32(cmd), uint64(arg), bufIn, bufOut))
 	})
 }
 
