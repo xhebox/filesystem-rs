@@ -40,25 +40,34 @@ tasks:
       - cmd: |
           set -eu
           mkdir -p tmp '{{.DIR}}'
-          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
-          rm -f tmp/libjuicefs.h
-          # Darwin only: the Go runtime's entry point is local in the archive, and
-          # its library constructor would start the runtime a second time, with
-          # the arguments dyld passes it. juicefs-rs calls the entry itself, so
-          # the entry is made global and the constructor is removed. Windows is
-          # not touched: its entry is already visible to the linker.
+          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags="-w -X=runtime.godebugDefault=asyncpreemptoff=1" -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
+          rm -f tmp/libjuicefs.h '{{.ARCHIVE}}'
+          # Strip the constructor that would start the runtime before juicefs-rs
+          # hands it argc/argv, rename Go's entry point to `juicefs_rt0`, merge
+          # the archive's objects with `ld -r`, and localize every non-`juicefs_*`
+          # symbol so the C/cgo internals cannot collide with another archive.
           if [ '{{OS}}' = darwin ]; then
-            case "$(go env GOARCH)" in
-            arm64) entry=__rt0_arm64_darwin_lib ;;
-            amd64) entry=__rt0_amd64_darwin_lib ;;
-            *) echo "juicefs: no darwin entry point for $(go env GOARCH)" >&2; exit 1 ;;
-            esac
+            entry="__rt0_$(go env GOARCH)_darwin_lib"
             # Rustup's llvm-tools puts llvm-objcopy beside the target libraries.
             objcopy=llvm-objcopy
             command -v llvm-objcopy >/dev/null 2>&1 || objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
-            "$objcopy" --strip-debug --remove-section=__DATA,__mod_init_func --globalize-symbol="$entry" tmp/libjuicefs.a
+            "$objcopy" --remove-section=__DATA,__mod_init_func \
+              --globalize-symbol="$entry" \
+              --globalize-symbol=_juicefs_rt0 \
+              --redefine-sym "$entry=_juicefs_rt0" \
+              tmp/libjuicefs.a
+            ld -r -all_load tmp/libjuicefs.a -o tmp/juicefs.o
+            "$objcopy" --strip-debug --wildcard --keep-global-symbol='_juicefs_*' tmp/juicefs.o
+          else
+            entry="_rt0_$(go env GOARCH)_windows_lib"
+            objcopy --remove-section=.ctors \
+              --redefine-sym "$entry=juicefs_rt0" \
+              tmp/libjuicefs.a
+            ld -r -dc --whole-archive tmp/libjuicefs.a -o tmp/juicefs.o
+            objcopy --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
           fi
-          mv -f tmp/libjuicefs.a '{{.ARCHIVE}}'
+          ar rcs '{{.ARCHIVE}}' tmp/juicefs.o
+          rm -f tmp/libjuicefs.a tmp/juicefs.o
         platforms: [darwin, windows]
 
   generate:

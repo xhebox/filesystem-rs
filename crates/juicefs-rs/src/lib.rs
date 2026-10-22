@@ -46,42 +46,25 @@ use asyncband::oneshot;
 /// ones behind it; more would only add Go `M`s.
 const WORKERS: usize = 4;
 
-/// The Go runtime's entry point in a c-archive.
-///
-/// `-buildmode=c-archive` starts the runtime from a library constructor, and
-/// **no** constructor is handed `argc`/`argv`: musl does not pass them to
-/// `.init_array` at all, dyld does not pass them to a Mach-O module
-/// initializer, and MSVC's `.CRT$XCU` gets none either. Go needs them —
-/// `runtime.sysargs` walks `argv` on through `envp` to `auxv` on Linux, and
-/// reads the `executable_path=` entry out of `envp` on macOS — so with the
-/// constructor's zeros it walks a null pointer and the process dies before the
-/// first call.
-///
-/// The archive the build leaves here has that constructor removed, and
-/// [`start_runtime`] makes the call instead, with the arguments the process
-/// really has. The name is Go's own, per platform and architecture; the
-/// `rt0_*.s` files under Go's `runtime/` define one each.
-macro_rules! go_entry {
-	($name:literal) => {
-		unsafe extern "C" {
-			#[link_name = $name]
-			fn go_entry(argc: c_int, argv: *mut *mut c_char);
-		}
-	};
+unsafe extern "C" {
+	/// The Go runtime's entry point in a c-archive.
+	///
+	/// `-buildmode=c-archive` starts the runtime from a library constructor, and
+	/// **no** constructor is handed `argc`/`argv`: musl does not pass them to
+	/// `.init_array` at all, dyld does not pass them to a Mach-O module
+	/// initializer, and MSVC's `.CRT$XCU` gets none either. Go needs them —
+	/// `runtime.sysargs` walks `argv` on through `envp` to `auxv` on Linux, and
+	/// reads the `executable_path=` entry out of `envp` on macOS — so with the
+	/// constructor's zeros it walks a null pointer and the process dies before the
+	/// first call.
+	///
+	/// The archive the build leaves here has that constructor removed, its
+	/// `_rt0_<arch>_<os>_lib` entry renamed to `juicefs_rt0`, and every
+	/// non-`juicefs_*` symbol localized so another Go archive can link into the
+	/// same process beside this one; [`start_runtime`] makes the entry call with
+	/// the arguments the process really has.
+	fn juicefs_rt0(argc: c_int, argv: *mut *mut c_char);
 }
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-go_entry!("_rt0_amd64_linux_lib");
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-go_entry!("_rt0_arm64_linux_lib");
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-go_entry!("_rt0_amd64_darwin_lib");
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-go_entry!("_rt0_arm64_darwin_lib");
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-go_entry!("_rt0_amd64_windows_lib");
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-go_entry!("_rt0_arm64_windows_lib");
 
 #[allow(non_camel_case_types, non_snake_case, unreachable_pub, dead_code)]
 mod binding;
@@ -119,10 +102,11 @@ pub fn start_runtime() {
 		let (argc, block) = startup_block();
 		// Go holds these pointers for the life of the process.
 		let block = Box::leak(block.into_boxed_slice());
-		// SAFETY: the entry calls into the Go runtime, which this crate's
-		// contract is that it happens once and first; `block` is the argument
-		// vector `runtime.sysargs` walks, laid out as the loader lays it out.
-		unsafe { go_entry(argc, block.as_mut_ptr()) }
+		// SAFETY: the entry calls into this archive's Go runtime, which this
+		// crate's contract is that it happens once and first; `block` is the
+		// argument vector `runtime.sysargs` walks, laid out as the loader lays
+		// it out.
+		unsafe { juicefs_rt0(argc, block.as_mut_ptr()) }
 	});
 }
 
@@ -150,12 +134,30 @@ fn startup_block() -> (c_int, Vec<*mut c_char>) {
 	let argc = block.len() as c_int;
 	block.push(std::ptr::null_mut());
 
-	block.extend(strings(std::env::vars_os().map(|(name, value)| {
-		let mut entry = name;
-		entry.push("=");
-		entry.push(value);
-		entry
-	})));
+	// When a second Go archive is linked into the same process, the later
+	// runtime's `sigfwdgo` chains `SIGSEGV`, `SIGBUS`, `SIGFPE` and `SIGPIPE`
+	// to the earlier one's handler, but drops `SIGURG` (`sigPreempt`) on any
+	// thread whose `g` in the later runtime's TLS slot is nil. Turning off
+	// signal-driven preemption leaves only cooperative preemption at function
+	// prologues, so neither runtime sends `SIGURG`.
+	let mut godebug = std::ffi::OsString::from("GODEBUG=");
+	if let Some(existing) = std::env::var_os("GODEBUG").filter(|value| !value.is_empty()) {
+		godebug.push(existing);
+		godebug.push(",");
+	}
+	godebug.push("asyncpreemptoff=1");
+
+	block.extend(strings(
+		std::env::vars_os()
+			.filter(|(name, _)| name != "GODEBUG")
+			.map(|(name, value)| {
+				let mut entry = name;
+				entry.push("=");
+				entry.push(value);
+				entry
+			})
+			.chain(std::iter::once(godebug)),
+	));
 	block.push(std::ptr::null_mut());
 
 	block.extend(auxv());
