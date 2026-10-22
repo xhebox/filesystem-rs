@@ -72,7 +72,11 @@ tasks:
             ld -r -dc --whole-archive tmp/libjuicefs.a \
               --no-whole-archive "$libgcc" \
               -o tmp/juicefs.o
-            objcopy --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
+            # MSVC's link.exe rejects the unwind tables GNU ld joins up here
+            # (LNK1223), and Go walks its own stack from the pclntab anyway, so
+            # drop them instead of teaching the merge to emit them its way.
+            objcopy --remove-section=.pdata --remove-section=.xdata \
+              --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
           fi
           ar rcs '{{.ARCHIVE}}' tmp/juicefs.o
           rm -f tmp/libjuicefs.a tmp/juicefs.o
