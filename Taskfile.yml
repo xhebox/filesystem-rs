@@ -1,10 +1,5 @@
 version: '3'
 
-# CI denies warnings: `setup-rust-toolchain` sets CARGO_BUILD_WARNINGS for it.
-# Set here too, so a local run fails on the same warnings CI does.
-env:
-  CARGO_BUILD_WARNINGS: deny
-
 vars:
   # The archive's name as `build.rs` spells it. go-task's OS and ARCH are Go's.
   HOST_RUST_OS: '{{if eq OS "darwin"}}macos{{else}}{{OS}}{{end}}'
