@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-const BASE_URL: &str = "https://github.com/felinics/filesystem-rs/releases/download";
+const BASE_URL: &str = "https://github.com/xhebox/filesystem-rs/releases/download";
 
 fn main() {
 	println!("cargo:rerun-if-env-changed=JUICEFS_CACHE");
