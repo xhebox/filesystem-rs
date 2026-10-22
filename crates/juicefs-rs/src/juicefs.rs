@@ -168,7 +168,9 @@ impl Volume {
 		let name_len = (record.namelen as usize).min(record.name.len());
 		record.name[..name_len]
 			.iter()
-			.map(|byte| *byte as u8)
+			// `c_char` is signed on x86 and unsigned on aarch64: `to_ne_bytes` reads it
+			// the same way on both, where a cast would be redundant on one.
+			.map(|byte| byte.to_ne_bytes()[0])
 			.collect()
 	}
 }
