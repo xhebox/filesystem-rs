@@ -56,7 +56,9 @@ tasks:
               --globalize-symbol=_juicefs_rt0 \
               --redefine-sym "$entry=_juicefs_rt0" \
               tmp/libjuicefs.a
-            cc -r -nostdlib -Wl,-all_load tmp/libjuicefs.a -o tmp/juicefs.o
+            # ld-classic asserts on the large relocation addends in Go's objects,
+            # so merge with ld-prime (`-ld_new`) instead.
+            cc -r -nostdlib -Wl,-ld_new -Wl,-all_load tmp/libjuicefs.a -o tmp/juicefs.o
             "$objcopy" --strip-debug --wildcard --keep-global-symbol='_juicefs_*' tmp/juicefs.o
           else
             entry="_rt0_{{ARCH}}_windows_lib"
