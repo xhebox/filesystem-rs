@@ -1,0 +1,16 @@
+# Keep target rustflags off build scripts and proc-macros, which the host builds: musl's crt-static cannot make a proc-macro.
+target-applies-to-host = false
+
+[unstable]
+target-applies-to-host = true
+
+[target.'cfg(all())']
+rustflags = ["-D", "warnings", "-C", "force-frame-pointers=yes", "-C", "symbol-mangling-version=v0"]
+
+# Static CRT so the binary does not need the VC++ redistributable.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Static musl so the binary runs on any Linux.
+[target.'cfg(all(target_os = "linux", target_env = "musl"))']
+rustflags = ["-C", "target-feature=+crt-static"]
