@@ -1,0 +1,46 @@
+version: '3'
+
+vars:
+  # The archive's name as `build.rs` spells it. go-task's OS and ARCH are Go's.
+  HOST_RUST_OS: '{{if eq OS "darwin"}}macos{{else}}{{OS}}{{end}}'
+  HOST_RUST_ARCH: '{{if eq ARCH "amd64"}}x86_64{{else if eq ARCH "arm64"}}aarch64{{else}}{{ARCH}}{{end}}'
+  # Where `build.rs` looks first for the archive.
+  DIR: '{{.ROOT_DIR}}/target/juicefs'
+  ARCHIVE: '{{.DIR}}/libjuicefs-{{.HOST_RUST_OS}}-{{.HOST_RUST_ARCH}}.a'
+  # Every target a release ships.
+  TARGETS: x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc
+
+tasks:
+  check:
+    desc: "Format and lint every target"
+    cmds:
+      - cargo fmt --all --check
+      - for: { var: TARGETS }
+        task: check-target
+        vars: { TARGET: '{{.ITEM}}' }
+
+  check-target:
+    internal: true
+    cmds:
+      - cargo clippy --all-targets --locked --target {{.TARGET}} {{.CLI_ARGS}}
+
+  test:
+    desc: "Run every test on the host"
+    deps: [juicefs]
+    cmds:
+      - cargo nextest run --locked {{.CLI_ARGS}}
+
+  juicefs:
+    desc: "Install the JuiceFS c-archive that juicefs-rs links into target/juicefs"
+    cmds:
+      # Linux builds in the container: its `cc` is musl's, which the archive needs.
+      - cmd: docker build --target artifact --output 'type=local,dest={{.DIR}}' crates/juicefs-rs
+        platforms: [linux]
+      # macOS and Windows build on the host, with cgo's own C compiler.
+      - cmd: |
+          set -eu
+          mkdir -p tmp '{{.DIR}}'
+          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
+          rm -f tmp/libjuicefs.h
+          mv -f tmp/libjuicefs.a '{{.ARCHIVE}}'
+        platforms: [darwin, windows]

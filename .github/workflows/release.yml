@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: [v*]
+
+permissions:
+  contents: read
+
+jobs:
+  dist:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Named as `build.rs` names them: libjuicefs-{os}-{arch}.a.
+        include:
+          - runs-on: ubuntu-26.04
+            asset: linux-x86_64
+          - runs-on: ubuntu-26.04-arm
+            asset: linux-aarch64
+          - runs-on: macos-26
+            asset: macos-aarch64
+          - runs-on: windows-2025
+            asset: windows-x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-task@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      # Linux builds its archive in the container; macOS and Windows build on the host.
+      - name: Install go
+        if: runner.os != 'Linux'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: crates/juicefs-rs/binding/go.mod
+
+      - name: Install mingw
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add mingw to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\mingw64\bin'
+
+      - name: Build juicefs
+        run: task juicefs
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libjuicefs-${{ matrix.asset }}
+          path: target/juicefs/libjuicefs-${{ matrix.asset }}.a
+          if-no-files-found: error
+
+  release:
+    needs: dist
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # build.rs downloads release v{version} for the version it was built at.
+      - name: Check the tag names the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME is not v$version" >&2; exit 1; }
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # SHA256SUMS names the archive as linked, not the compressed file: build.rs
+      # checks the digest of what the zstd stream unpacks to.
+      - name: Checksum and compress
+        run: |
+          cd dist
+          sha256sum libjuicefs-*.a > SHA256SUMS
+          zstd -19 --rm libjuicefs-*.a
+          ls -l
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

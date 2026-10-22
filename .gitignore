@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Go
+*.test
+*.out
+
+# `go build` writes the archive's binary here: `binding` is a main package, and
+# Go names its output after the module path's last element, not the directory.
+crates/juicefs-rs/binding/juicefs
+
+# Scratch output from local runs. Nothing in here is a source file.
+/tmp

@@ -1,0 +1,86 @@
+name: Test
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-task@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      # rust-toolchain.toml brings every target the check crosses to.
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # Leave RUSTFLAGS unset; it would override the rustflags in .cargo/config.toml.
+          rustflags: ""
+          cache-shared-key: cargo-check
+
+      - name: Check
+        run: task check
+
+  test:
+    name: ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-26.04
+            target: x86_64-unknown-linux-musl
+          - runs-on: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-musl
+          - runs-on: macos-26
+            target: aarch64-apple-darwin
+          - runs-on: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-task@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      # macOS and Windows build the archive on the host, with this Go.
+      - name: Install go
+        if: runner.os != 'Linux'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: crates/juicefs-rs/binding/go.mod
+
+      # cgo on Windows still compiles with MinGW's gcc; Rust links the result as MSVC.
+      - name: Install mingw
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add mingw to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\mingw64\bin'
+
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          # Leave RUSTFLAGS unset; it would override the rustflags in .cargo/config.toml.
+          rustflags: ""
+          cache-shared-key: cargo-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Test
+        run: task test -- --target ${{ matrix.target }}

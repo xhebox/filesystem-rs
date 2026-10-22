@@ -1,0 +1,12 @@
+allow-print-in-tests = true
+disallowed-methods = [
+	{ path = "std::env::temp_dir", reason = "use testutil::tempdir in tests, or an explicit directory (util::dirs) at runtime" },
+	{ path = "tempfile::tempdir", reason = "use testutil::tempdir in tests, or an explicit directory (util::dirs) at runtime" },
+	{ path = "tempfile::tempfile", reason = "use testutil::tempdir in tests, or tempfile::tempfile_in with an explicit base" },
+	{ path = "tempfile::TempDir::new", reason = "use testutil::tempdir in tests, or an explicit directory (util::dirs) at runtime" },
+	{ path = "tempfile::NamedTempFile::new", reason = "use tempfile::NamedTempFile::new_in with an explicit base" },
+	{ path = "tempfile::Builder::tempdir", reason = "use tempfile::Builder::tempdir_in with an explicit base" },
+	{ path = "tempfile::Builder::tempfile", reason = "use tempfile::Builder::tempfile_in with an explicit base" },
+	{ path = "rustix::fs::flock", allow-invalid = true, reason = "take file locks through fd_lock::RwLock::try_write" },
+	{ path = "libc::flock", allow-invalid = true, reason = "take file locks through fd_lock::RwLock::try_write" },
+]

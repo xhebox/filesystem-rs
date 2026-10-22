@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+fuse-api = { version = "0.1.0", path = "crates/fuse-api" }
+asyncband = { version = "0.7.3", features = ["oneshot"] }
+libc = "0.2"
+log = { version = "0.4.34", features = ["std", "kv"] }
+
+# Every crate inherits lints with `[lints] workspace = true`.
+[workspace.lints.rust]
+let_underscore_drop = "deny"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+disallowed_methods = "deny"
+len_without_is_empty = "allow"
+len_zero = "allow"
+print_stderr = "deny"
+print_stdout = "deny"
+pub_underscore_fields = "deny"
+tabs_in_doc_comments = "allow"
+too_many_arguments = "allow"
+wildcard_imports = "deny"

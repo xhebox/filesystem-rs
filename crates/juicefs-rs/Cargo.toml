@@ -1,0 +1,18 @@
+[package]
+name = "juicefs-rs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+sha2 = "0.10"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dependencies]
+asyncband = { workspace = true }
+fuse-api = { workspace = true }
+log = { workspace = true }
+
+[lints]
+workspace = true
