@@ -70,7 +70,9 @@ jobs:
           choco install winfsp -y --no-progress
           $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse'
           if (-not (Test-Path (Join-Path $inc 'fuse_common.h'))) { throw "WinFsp header not found under $inc" }
-          Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I`"$($inc -replace '\\', '/')`""
+          # cgo splits CGO_CFLAGS on spaces, so the path goes in as its 8.3 short form.
+          $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($inc).ShortPath -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$short"
 
       - name: Build juicefs
         run: task juicefs
