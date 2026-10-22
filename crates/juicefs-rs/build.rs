@@ -178,8 +178,15 @@ fn link(archive: Option<&Path>, lib: &str, target_os: &str) {
 		"linux" => &["pthread", "dl", "m"],
 		// Go's `crypto/x509` reaches into these on macOS.
 		"macos" => &["framework=Security", "framework=CoreFoundation"],
-		// Go's Windows runtime calls into these directly.
-		"windows" => &["ws2_32", "ntdll", "userenv"],
+		// Go's Windows runtime and cgo's MinGW objects call into these directly;
+		// `legacy_stdio_definitions` supplies the `fprintf` symbol UCRT inline-wrapped.
+		"windows" => &[
+			"advapi32",
+			"legacy_stdio_definitions",
+			"ntdll",
+			"userenv",
+			"ws2_32",
+		],
 		_ => &[],
 	};
 	for lib in system {

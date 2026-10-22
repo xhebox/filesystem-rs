@@ -56,14 +56,18 @@ tasks:
               --globalize-symbol=_juicefs_rt0 \
               --redefine-sym "$entry=_juicefs_rt0" \
               tmp/libjuicefs.a
-            ld -r -all_load tmp/libjuicefs.a -o tmp/juicefs.o
+            ld -r -arch "$(uname -m)" -all_load tmp/libjuicefs.a -o tmp/juicefs.o
             "$objcopy" --strip-debug --wildcard --keep-global-symbol='_juicefs_*' tmp/juicefs.o
           else
             entry="_rt0_$(go env GOARCH)_windows_lib"
             objcopy --remove-section=.ctors \
               --redefine-sym "$entry=juicefs_rt0" \
               tmp/libjuicefs.a
-            ld -r -dc --whole-archive tmp/libjuicefs.a -o tmp/juicefs.o
+            # MinGW's gcc emits calls to `___chkstk_ms` from `libgcc.a`; pulling
+            # it into `juicefs.o` here resolves it before MSVC's `link.exe` runs.
+            ld -r -dc --whole-archive tmp/libjuicefs.a \
+              --no-whole-archive "$(gcc -print-libgcc-file-name)" \
+              -o tmp/juicefs.o
             objcopy --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
           fi
           ar rcs '{{.ARCHIVE}}' tmp/juicefs.o
