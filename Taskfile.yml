@@ -42,6 +42,22 @@ tasks:
           mkdir -p tmp '{{.DIR}}'
           (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
           rm -f tmp/libjuicefs.h
+          # Darwin only: the Go runtime's entry point is local in the archive, and
+          # its library constructor would start the runtime a second time, with
+          # the arguments dyld passes it. juicefs-rs calls the entry itself, so
+          # the entry is made global and the constructor is removed. Windows is
+          # not touched: its entry is already visible to the linker.
+          if [ '{{OS}}' = darwin ]; then
+            case "$(go env GOARCH)" in
+            arm64) entry=__rt0_arm64_darwin_lib ;;
+            amd64) entry=__rt0_amd64_darwin_lib ;;
+            *) echo "juicefs: no darwin entry point for $(go env GOARCH)" >&2; exit 1 ;;
+            esac
+            # Rustup's llvm-tools puts llvm-objcopy beside the target libraries.
+            objcopy=llvm-objcopy
+            command -v llvm-objcopy >/dev/null 2>&1 || objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
+            "$objcopy" --strip-debug --remove-section=__DATA,__mod_init_func --globalize-symbol="$entry" tmp/libjuicefs.a
+          fi
           mv -f tmp/libjuicefs.a '{{.ARCHIVE}}'
         platforms: [darwin, windows]
 

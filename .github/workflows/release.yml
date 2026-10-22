@@ -38,6 +38,16 @@ jobs:
         with:
           go-version-file: crates/juicefs-rs/binding/go.mod
 
+      # The darwin archive's entry point is made global with llvm-objcopy, which
+      # rustup's llvm-tools component provides.
+      - name: Install rust
+        if: runner.os == 'macOS'
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # Leave RUSTFLAGS unset; it would override the rustflags in .cargo/config.toml.
+          rustflags: ""
+          cache-shared-key: cargo-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install mingw
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -50,6 +60,17 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\mingw64\bin'
+
+      # cgofuse, which the VFS imports on Windows, includes WinFsp's header. Fail
+      # here, where the missing header is named, rather than in the Go build.
+      - name: Install WinFsp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse'
+          if (-not (Test-Path (Join-Path $inc 'fuse_common.h'))) { throw "WinFsp header not found under $inc" }
+          Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I`"$($inc -replace '\\', '/')`""
 
       - name: Build juicefs
         run: task juicefs
