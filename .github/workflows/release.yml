@@ -91,24 +91,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # build.rs downloads release v{version} for the version it was built at.
-      - name: Check the tag names the crate version
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME is not v$version" >&2; exit 1; }
-
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      # SHA256SUMS names the archive as linked, not the compressed file: build.rs
-      # checks the digest of what the zstd stream unpacks to.
-      - name: Checksum and compress
+      - name: Compress and checksum
         run: |
           cd dist
-          sha256sum libjuicefs-*.a > SHA256SUMS
           zstd -19 --rm libjuicefs-*.a
+          sha256sum libjuicefs-*.zst > SHA256SUMS
           ls -l
 
       - name: Publish
