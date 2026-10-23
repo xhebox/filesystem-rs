@@ -11,13 +11,13 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-const BASE_URL: &str = "https://github.com/felinics/filesystem-rs/releases/download";
+const BASE_URL: &str = "https://github.com/xhebox/filesystem-rs/releases/download";
 
 fn main() {
 	println!("cargo:rerun-if-env-changed=JUICEFS_CACHE");
@@ -58,28 +58,27 @@ fn main() {
 	link(archive.as_deref(), &lib, &target_os);
 }
 
-/// Downloads `name` from release `v{version}` into `archive`, once its digest
-/// matches the one `SHA256SUMS` gives it.
+/// Downloads `name`'s compressed form from release `v{version}`, checks its digest
+/// against the one `SHA256SUMS` gives it, and only then unpacks it into `archive`.
 fn fetch(version: &str, name: &str, archive: &Path) -> Result<(), String> {
 	let directory = format!("{BASE_URL}/v{version}");
+	let zst = format!("{name}.zst");
 	let sums = get(&format!("{directory}/SHA256SUMS"))?
 		.read_to_string()
 		.map_err(|error| error.to_string())?;
-	let expected = expected_digest(&sums, name)
-		.ok_or_else(|| format!("{directory}/SHA256SUMS has no line for {name}"))?;
+	let expected = expected_digest(&sums, &zst)
+		.ok_or_else(|| format!("{directory}/SHA256SUMS has no line for {zst}"))?;
 
 	let parent = archive.parent().expect("the archive has a parent");
 	fs::create_dir_all(parent)
 		.map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-	// Unpacked beside the final name, so a half-written archive is never what a
-	// later build finds.
+	// Both are written beside their final names, so a half-written file is never
+	// what a later build finds.
+	let compressed = parent.join(format!(".{zst}.part"));
 	let part = parent.join(format!(".{name}.part"));
-	let checked = unpack(&format!("{directory}/{name}.zst"), &part).and_then(|actual| {
-		if actual == expected {
-			return Ok(());
-		}
-		Err(format!("{name} hashes to {actual}, not {expected}"))
-	});
+	let checked = download(&format!("{directory}/{zst}"), &compressed, &expected)
+		.and_then(|()| unpack(&compressed, &part));
+	drop(fs::remove_file(&compressed));
 	if let Err(reason) = checked {
 		drop(fs::remove_file(&part));
 		return Err(reason);
@@ -112,26 +111,38 @@ fn get(url: &str) -> Result<ureq::Body, String> {
 	Ok(response.into_body())
 }
 
-/// Streams `url` through the decompressor into `part`, and returns the digest of
-/// what was written. Hashing on the way means the archive is never read twice,
-/// and never has to sit in memory beside the several times larger thing it
-/// unpacks to.
-fn unpack(url: &str, part: &Path) -> Result<String, String> {
-	let mut decoder = ruzstd::decoding::StreamingDecoder::new(get(url)?.into_reader())
-		.map_err(|error| format!("not one zstd frame: {error}"))?;
-	let file = File::create(part).map_err(|error| error.to_string())?;
+/// Streams `url` into `file`, and fails unless the digest of what was written is
+/// `expected`. Hashing on the way means the download is never read twice.
+fn download(url: &str, file: &Path, expected: &str) -> Result<(), String> {
+	let mut body = get(url)?.into_reader();
+	let out = File::create(file).map_err(|error| error.to_string())?;
 	let mut hashing = Hashing {
-		file: BufWriter::new(file),
+		file: BufWriter::new(out),
 		hasher: Sha256::new(),
 	};
-	io::copy(&mut decoder, &mut hashing).map_err(|error| error.to_string())?;
+	io::copy(&mut body, &mut hashing).map_err(|error| error.to_string())?;
 	hashing.flush().map_err(|error| error.to_string())?;
-	Ok(hashing
+	let actual: String = hashing
 		.hasher
 		.finalize()
 		.iter()
 		.map(|byte| format!("{byte:02x}"))
-		.collect())
+		.collect();
+	if actual == expected {
+		return Ok(());
+	}
+	Err(format!("{url} hashes to {actual}, not {expected}"))
+}
+
+/// Decodes the zstd stream in `compressed` into `part`.
+fn unpack(compressed: &Path, part: &Path) -> Result<(), String> {
+	let input = File::open(compressed).map_err(|error| error.to_string())?;
+	let mut decoder = ruzstd::decoding::StreamingDecoder::new(BufReader::new(input))
+		.map_err(|error| format!("not one zstd frame: {error}"))?;
+	let file = File::create(part).map_err(|error| error.to_string())?;
+	let mut out = BufWriter::new(file);
+	io::copy(&mut decoder, &mut out).map_err(|error| error.to_string())?;
+	out.flush().map_err(|error| error.to_string())
 }
 
 /// Writes through to `file`, hashing every byte that gets written.
@@ -178,11 +189,25 @@ fn link(archive: Option<&Path>, lib: &str, target_os: &str) {
 		"linux" => &["pthread", "dl", "m"],
 		// Go's `crypto/x509` reaches into these on macOS.
 		"macos" => &["framework=Security", "framework=CoreFoundation"],
-		// Go's Windows runtime calls into these directly.
-		"windows" => &["ws2_32", "ntdll", "userenv"],
+		// Go's Windows runtime and cgo's MinGW objects call into these directly;
+		// `legacy_stdio_definitions` supplies the `fprintf` symbol UCRT inline-wrapped.
+		"windows" => &[
+			"advapi32",
+			"legacy_stdio_definitions",
+			"ntdll",
+			"userenv",
+			"ws2_32",
+		],
 		_ => &[],
 	};
 	for lib in system {
 		println!("cargo:rustc-link-lib={lib}");
+	}
+
+	// `legacy_stdio_definitions.lib` carries two `.drectve` sections that disagree
+	// about their attributes; link.exe's LNK4078 for it is noise, and the
+	// workspace links with `-D warnings`.
+	if target_os == "windows" {
+		println!("cargo:rustc-link-arg=/ignore:4078");
 	}
 }

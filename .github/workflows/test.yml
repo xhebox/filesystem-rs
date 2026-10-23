@@ -71,6 +71,19 @@ jobs:
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\mingw64\bin'
 
+      # cgofuse, which the VFS imports on Windows, includes WinFsp's header. Fail
+      # here, where the missing header is named, rather than in the Go build.
+      - name: Install WinFsp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse'
+          if (-not (Test-Path (Join-Path $inc 'fuse_common.h'))) { throw "WinFsp header not found under $inc" }
+          # cgo splits CGO_CFLAGS on spaces, so the path goes in as its 8.3 short form.
+          $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($inc).ShortPath -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$short"
+
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:

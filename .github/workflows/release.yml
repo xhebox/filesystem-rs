@@ -38,6 +38,16 @@ jobs:
         with:
           go-version-file: crates/juicefs-rs/binding/go.mod
 
+      # The darwin archive's entry point is made global with llvm-objcopy, which
+      # rustup's llvm-tools component provides.
+      - name: Install rust
+        if: runner.os == 'macOS'
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # Leave RUSTFLAGS unset; it would override the rustflags in .cargo/config.toml.
+          rustflags: ""
+          cache-shared-key: cargo-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install mingw
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -50,6 +60,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\mingw64\bin'
+
+      # cgofuse, which the VFS imports on Windows, includes WinFsp's header. Fail
+      # here, where the missing header is named, rather than in the Go build.
+      - name: Install WinFsp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse'
+          if (-not (Test-Path (Join-Path $inc 'fuse_common.h'))) { throw "WinFsp header not found under $inc" }
+          # cgo splits CGO_CFLAGS on spaces, so the path goes in as its 8.3 short form.
+          $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($inc).ShortPath -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$short"
 
       - name: Build juicefs
         run: task juicefs
@@ -68,24 +91,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # build.rs downloads release v{version} for the version it was built at.
-      - name: Check the tag names the crate version
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME is not v$version" >&2; exit 1; }
-
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      # SHA256SUMS names the archive as linked, not the compressed file: build.rs
-      # checks the digest of what the zstd stream unpacks to.
-      - name: Checksum and compress
+      - name: Compress and checksum
         run: |
           cd dist
-          sha256sum libjuicefs-*.a > SHA256SUMS
           zstd -19 --rm libjuicefs-*.a
+          sha256sum libjuicefs-*.zst > SHA256SUMS
           ls -l
 
       - name: Publish

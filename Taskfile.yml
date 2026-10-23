@@ -40,7 +40,54 @@ tasks:
       - cmd: |
           set -eu
           mkdir -p tmp '{{.DIR}}'
-          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
-          rm -f tmp/libjuicefs.h
-          mv -f tmp/libjuicefs.a '{{.ARCHIVE}}'
+          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags="-w -X=runtime.godebugDefault=asyncpreemptoff=1" -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
+          rm -f tmp/libjuicefs.h '{{.ARCHIVE}}'
+          # Strip the constructor that would start the runtime before juicefs-rs
+          # hands it argc/argv, rename Go's entry point to `juicefs_rt0`, merge
+          # the archive's objects with `ld -r`, and localize every non-`juicefs_*`
+          # symbol so the C/cgo internals cannot collide with another archive.
+          if [ '{{OS}}' = darwin ]; then
+            entry="__rt0_{{ARCH}}_darwin_lib"
+            # Rustup's llvm-tools puts llvm-objcopy beside the target libraries.
+            objcopy=llvm-objcopy
+            command -v llvm-objcopy >/dev/null 2>&1 || objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
+            "$objcopy" --remove-section=__DATA,__mod_init_func \
+              --globalize-symbol="$entry" \
+              --globalize-symbol=_juicefs_rt0 \
+              --redefine-sym "$entry=_juicefs_rt0" \
+              tmp/libjuicefs.a
+            # ld-classic asserts on the large relocation addends in Go's objects,
+            # so merge with ld-prime (`-ld_new`) instead.
+            cc -r -nostdlib -Wl,-ld_new -Wl,-all_load tmp/libjuicefs.a -o tmp/juicefs.o
+            "$objcopy" --strip-debug --wildcard --keep-global-symbol='_juicefs_*' tmp/juicefs.o
+          else
+            entry="_rt0_{{ARCH}}_windows_lib"
+            objcopy --remove-section=.ctors \
+              --redefine-sym "$entry=juicefs_rt0" \
+              tmp/libjuicefs.a
+            # MinGW's gcc emits calls to `___chkstk_ms` from `libgcc.a`; pulling
+            # it into `juicefs.o` here resolves it before MSVC's `link.exe` runs.
+            libgcc="$(gcc -print-libgcc-file-name)"
+            libgcc="${libgcc%"$(printf '\r')"}"
+            ld -r -dc --whole-archive tmp/libjuicefs.a \
+              --no-whole-archive "$libgcc" \
+              -o tmp/juicefs.o
+            # MSVC's link.exe rejects the unwind tables GNU ld joins up here
+            # (LNK1223), and Go walks its own stack from the pclntab anyway, so
+            # drop them instead of teaching the merge to emit them its way.
+            objcopy --remove-section=.pdata --remove-section=.xdata \
+              --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
+          fi
+          ar rcs '{{.ARCHIVE}}' tmp/juicefs.o
+          rm -f tmp/libjuicefs.a tmp/juicefs.o
         platforms: [darwin, windows]
+
+  generate:
+    desc: "Regenerate src/binding.rs from the Go archive's C header (needs bindgen and libclang)"
+    cmds:
+      - cmd: |
+          set -eu
+          mkdir -p tmp/generate
+          (cd crates/juicefs-rs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/generate/libjuicefs.a' .)
+          rm -f tmp/generate/libjuicefs.a
+          bindgen tmp/generate/libjuicefs.h --allowlist-function 'juicefs_.*' --allowlist-type 'juicefs_.*' --with-derive-default --impl-debug --rust-target 1.85 --rust-edition 2024 -o crates/juicefs-rs/src/binding.rs

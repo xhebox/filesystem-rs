@@ -1,0 +1,8 @@
+# Keep target rustflags off build scripts and proc-macros, which the host builds: musl's crt-static cannot make a proc-macro.
+target-applies-to-host = false
+
+[unstable]
+target-applies-to-host = true
+
+[target.'cfg(all())']
+rustflags = ["-D", "warnings", "-C", "force-frame-pointers=yes", "-C", "symbol-mangling-version=v0"]

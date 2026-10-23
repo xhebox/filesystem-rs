@@ -13,3 +13,4 @@ crates/juicefs-rs/binding/juicefs
 
 # Scratch output from local runs. Nothing in here is a source file.
 /tmp
+/ignore
