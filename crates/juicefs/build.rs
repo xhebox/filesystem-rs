@@ -50,7 +50,7 @@ fn main() {
 			Ok(()) => Some(out),
 			Err(reason) => {
 				println!(
-					"cargo:warning=juicefs-rs: {reason}; `task juicefs` builds it, and linking needs it"
+					"cargo:warning=boxfs-juicefs: {reason}; `task juicefs` builds it, and linking needs it"
 				);
 				None
 			}

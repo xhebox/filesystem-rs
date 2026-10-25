@@ -1,9 +1,9 @@
-# The JuiceFS c-archive juicefs-rs links, for Linux. Build it with this directory
+# The JuiceFS c-archive boxfs-juicefs links, for Linux. Build it with this directory
 # as the context:
 #
-#   docker build --target artifact --output type=local,dest=DIR crates/juicefs-rs
+#   docker build --target artifact --output type=local,dest=DIR crates/juicefs
 #
-# writes libjuicefs-linux-<arch>.a into DIR, under the name juicefs-rs's build.rs
+# writes libjuicefs-linux-<arch>.a into DIR, under the name boxfs-juicefs's build.rs
 # looks for. Nothing else is written to the host.
 #
 # The build stage is Alpine, whose `cc` is musl's: the archive is linked into a

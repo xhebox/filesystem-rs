@@ -1,5 +1,5 @@
-//! The filesystem interface a FUSE back-end implements, plus the reply
-//! types the server passes to it.
+//! The FUSE protocol interface a back-end implements, plus the request and
+//! reply types the transport passes to it.
 
 use std::ffi::CStr;
 use std::io;
@@ -22,10 +22,10 @@ impl Context {
 	}
 }
 
-/// A directory entry in a READDIR/READDIRPLUS reply.
+/// A directory entry in a READDIR/READDIRPLUS or [`Volume::list`](crate::Volume::list) reply.
 #[derive(Clone, Debug, Default)]
 pub struct DirEntry {
-	/// Inode number the guest should use.
+	/// Inode number.
 	pub ino: u64,
 	/// Offset that resumes the listing after this entry.
 	pub offset: u64,
@@ -84,10 +84,10 @@ pub trait ZeroCopyReader {
 	fn extents(&self, count: usize) -> Vec<Extent>;
 }
 
-/// The operations the server dispatches to. Every method has a default that
-/// reports `ENOSYS`, so a back-end implements only what it serves.
+/// The FUSE operations a transport dispatches to. Every method has a default
+/// that reports `ENOSYS`, so a back-end implements only what it serves.
 #[allow(async_fn_in_trait)]
-pub trait FileSystem {
+pub trait Fuse {
 	type Inode: Into<u64> + From<u64> + Copy;
 	type Handle: Into<u64> + From<u64> + Copy;
 
@@ -404,8 +404,8 @@ pub struct Extent {
 	pub len: usize,
 }
 
-/// The error every unimplemented operation reports: the guest's `ENOSYS`.
-fn unsupported() -> io::Error {
+/// The error every unimplemented operation reports: `ENOSYS`.
+pub(crate) fn unsupported() -> io::Error {
 	io::Error::from_raw_os_error(libc::ENOSYS)
 }
 

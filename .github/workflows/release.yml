@@ -36,7 +36,7 @@ jobs:
         if: runner.os != 'Linux'
         uses: actions/setup-go@v6
         with:
-          go-version-file: crates/juicefs-rs/binding/go.mod
+          go-version-file: crates/juicefs/binding/go.mod
 
       # The darwin archive's entry point is made global with llvm-objcopy, which
       # rustup's llvm-tools component provides.

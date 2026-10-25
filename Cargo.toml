@@ -3,14 +3,17 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 
 [workspace.dependencies]
-fuse-api = { version = "0.1.0", path = "crates/fuse-api" }
+api = { package = "boxfs-api", version = "0.1.1", path = "crates/api" }
 asyncband = { version = "0.7.3", features = ["oneshot"] }
 completion = { package = "completion-async", version = "0.2.0" }
+fs-core = { package = "rust-fs-core", version = "0.3.15" }
+fs-erofs = { package = "rust-fs-erofs", version = "0.5.0" }
+imbl = "7"
 libc = "0.2"
 log = { version = "0.4.34", features = ["std", "kv"] }
 rustix = "1.1"

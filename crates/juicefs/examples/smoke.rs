@@ -6,7 +6,7 @@
 //! downloaded the archive published for this crate's version.
 //!
 //! ```text
-//! cargo run -p juicefs-rs --example smoke [META-URL]
+//! cargo run -p boxfs-juicefs --example smoke [META-URL]
 //! ```
 //!
 //! `JUICEFS_CACHE` moves that cache, here as in the build script.
@@ -47,21 +47,21 @@ fn main() -> io::Result<()> {
 	let argument = std::env::args().nth(1);
 	let cache = std::path::Path::new("/tmp/juicefs-smoke");
 
-	juicefs_rs::start_runtime();
+	boxfs_juicefs::start_runtime();
 	println!("the Go runtime started");
 
 	let Some(meta) = argument else {
-		match juicefs_rs::Volume::mount("sqlite3:///nonexistent/volume.db", cache) {
+		match boxfs_juicefs::Volume::mount("sqlite3:///nonexistent/volume.db", cache) {
 			Ok(_) => println!("a volume that cannot exist mounted: wrong"),
 			Err(error) => println!("mount refused, as it should be: {error}"),
 		}
 		return Ok(());
 	};
 
-	let volume = juicefs_rs::Volume::mount(&meta, cache)?;
+	let volume = boxfs_juicefs::Volume::mount(&meta, cache)?;
 	println!("mounted");
 
-	let ctx = juicefs_rs::Ctx::default();
+	let ctx = boxfs_juicefs::Ctx::default();
 	let root = block_on(volume.getattr(ctx, 1, false))?;
 	println!(
 		"GETATTR root: typ={} mode={:o} nlink={} uid={} gid={}",

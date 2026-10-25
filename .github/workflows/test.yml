@@ -55,7 +55,7 @@ jobs:
         if: runner.os != 'Linux'
         uses: actions/setup-go@v6
         with:
-          go-version-file: crates/juicefs-rs/binding/go.mod
+          go-version-file: crates/juicefs/binding/go.mod
 
       # cgo on Windows still compiles with MinGW's gcc; Rust links the result as MSVC.
       - name: Install mingw
