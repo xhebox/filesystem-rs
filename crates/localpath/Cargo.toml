@@ -1,13 +1,12 @@
 [package]
-name = "localpath-rs"
+name = "boxfs-localpath"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# The back-end is Unix-only (see `lib.rs`), so its dependencies are too.
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+api = { workspace = true }
 completion = { workspace = true }
-fuse-api = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 

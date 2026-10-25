@@ -1,10 +1,12 @@
 [package]
-name = "fuse-api"
+name = "boxfs-memfs"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+api = { workspace = true }
+imbl = { workspace = true }
 libc = { workspace = true }
 
 [lints]

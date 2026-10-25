@@ -1,5 +1,5 @@
 [package]
-name = "juicefs-rs"
+name = "boxfs-juicefs"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -10,7 +10,9 @@ sha2 = "0.10"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dependencies]
+api = { workspace = true }
 asyncband = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 
 [lints]
