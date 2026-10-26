@@ -29,7 +29,7 @@ use crate::abi::{
 	FATTR_ATIME, FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
 	FATTR_UID, FOPEN_DIRECT_IO, FUSE_ASYNC_READ, FUSE_BIG_WRITES, ROOT_ID,
 };
-use crate::span::{engine_io, read_into, write_into};
+use crate::span::{engine_io, read_exact, read_into, write_into};
 use api::{
 	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
 	ListxattrReply, Snapshot, Volume, ZeroCopyReader, ZeroCopyWriter,
@@ -1166,11 +1166,7 @@ impl Volume for PassthroughFs {
 			return Ok(Vec::new());
 		}
 		let mut buffer = completion::Buffer::zeroed(len);
-		let outcome = file.read_exact_at(buffer.clone(), 0).await;
-		let count = match outcome.result.map_err(engine_io) {
-			Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => outcome.value,
-			result => result.map(|()| outcome.value)?,
-		};
+		let count = read_exact(&file, buffer.clone(), 0).await?;
 		Ok(buffer.get_mut().expect("the read landed")[..count].to_vec())
 	}
 
@@ -1182,7 +1178,6 @@ impl Volume for PassthroughFs {
 		let buffer = completion::Buffer::from(data.to_vec());
 		file.write_all_at(buffer, 0)
 			.await
-			.into_result()
 			.map(|_| ())
 			.map_err(engine_io)
 	}
