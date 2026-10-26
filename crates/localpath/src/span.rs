@@ -18,6 +18,30 @@ pub(crate) fn engine_io(error: completion::Error) -> io::Error {
 	io::Error::try_from(error).unwrap_or_else(io::Error::other)
 }
 
+/// Reads into `buffer` at `offset` until it is full or the file ends, returning
+/// the bytes that landed.
+///
+/// The end of the file is not a failure: the error carries the bytes moved
+/// before it, and that short count is what the guest gets.
+pub(crate) async fn read_exact<M: AsIoVec>(
+	file: &completion::File,
+	buffer: M,
+	offset: u64,
+) -> io::Result<usize> {
+	match file.read_exact_at(buffer, offset).await {
+		Ok(count) => Ok(count),
+		Err(error) => {
+			let done = error.done();
+			let error = engine_io(error);
+			if error.kind() == io::ErrorKind::UnexpectedEof {
+				Ok(done)
+			} else {
+				Err(error)
+			}
+		}
+	}
+}
+
 /// `len` bytes of a [`Memory`] from `offset`, resolved to a pointer.
 ///
 /// The span holds the memory it resolved against, so the pointer stays valid
@@ -63,10 +87,10 @@ unsafe impl AsIoVec for Span {
 /// Reads up to `size` bytes of `file` at `offset` into the reply body.
 ///
 /// One call moves one extent: the engine's span resolves to one pointer, and
-/// the reply's ranges are not contiguous. The calls go out together and are
-/// waited in order, so the file is read once and the reply's ranges are filled
-/// in the order the guest named them; the end of the file ends it, and the
-/// bytes moved by then are a short read, not a failure.
+/// the reply's ranges are not contiguous. The calls are made in the order the
+/// guest named them, so the file is read once and the reply's ranges are filled
+/// in that order; the end of the file ends it, and the bytes moved by then are
+/// a short read, not a failure.
 pub(crate) async fn read_into(
 	file: &completion::File,
 	out: &dyn ZeroCopyWriter,
@@ -76,7 +100,7 @@ pub(crate) async fn read_into(
 	let memory = out.memory();
 	let mut room = size;
 	let mut at = offset;
-	let mut calls = Vec::new();
+	let mut read = 0;
 	for extent in out.extents() {
 		let len = extent.len.min(room);
 		if len == 0 {
@@ -85,24 +109,18 @@ pub(crate) async fn read_into(
 		let Ok(span) = Span::new(Arc::clone(&memory), extent.offset as usize, len) else {
 			break;
 		};
-		calls.push(file.read_exact_at(span, at));
+		// A call that stops early returns what it did read: the end of the file
+		// is such a stop, the reply is a short read, and the range the call did
+		// not fill stays unwritten.
+		let count = read_exact(file, span, at).await?;
+		read += count;
+		if count < len {
+			break;
+		}
 		at += len as u64;
 		room -= len;
 		if room == 0 {
 			break;
-		}
-	}
-	// A call that stops early reports what it did read beside its failure, and
-	// the end of the file is such a stop: the reply is a short read, and the
-	// range the call did not fill stays unwritten.
-	let mut read = 0;
-	for call in calls {
-		let outcome = call.await;
-		read += outcome.value;
-		match outcome.result.map_err(engine_io) {
-			Ok(()) => {}
-			Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(read),
-			Err(error) => return Err(error),
 		}
 	}
 	Ok(read)
@@ -130,11 +148,9 @@ pub(crate) async fn write_into(
 		let Ok(span) = Span::new(Arc::clone(&memory), extent.offset as usize, extent.len) else {
 			break;
 		};
-		match file.write_all_at(span, at).await.into_result() {
-			Ok(count) => written += count,
-			Err(error) => return Err(engine_io(error)),
-		}
-		at += extent.len as u64;
+		let count = file.write_all_at(span, at).await.map_err(engine_io)?;
+		written += count;
+		at += count as u64;
 	}
 	Ok(written)
 }
