@@ -109,3 +109,32 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  crates-io:
+    needs: release
+    runs-on: ubuntu-26.04
+    # Trusted publishing on crates.io names this environment, which only v* tags may deploy to.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # Leave RUSTFLAGS unset; it would override the rustflags in .cargo/config.toml.
+          rustflags: ""
+          cache: false
+
+      - uses: rust-lang/crates-io-auth-action@v1.0.5
+        id: auth
+
+      # The whole workspace in one go: cargo publishes in dependency order and
+      # waits for each crate to reach the index, so `boxfs-api` is there before
+      # the crates that depend on it.
+      - name: Publish
+        run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
