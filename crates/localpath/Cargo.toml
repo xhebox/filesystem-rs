@@ -1,4 +1,10 @@
 [package]
+description = "Host-directory back-end for boxfs, with every name resolved beneath one descriptor"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 name = "boxfs-localpath"
 version.workspace = true
 edition.workspace = true

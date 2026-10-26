@@ -1,4 +1,10 @@
 [package]
+description = "In-memory file system back-end for boxfs, with persistent-tree snapshots"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 name = "boxfs-memfs"
 version.workspace = true
 edition.workspace = true

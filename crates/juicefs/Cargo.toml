@@ -1,4 +1,10 @@
 [package]
+description = "JuiceFS volume back-end for boxfs, linking the Go c-archive"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 name = "boxfs-juicefs"
 version.workspace = true
 edition.workspace = true

@@ -1,4 +1,10 @@
 [package]
+description = "Read-only EROFS image back-end for boxfs"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 name = "boxfs-erofs"
 version.workspace = true
 edition.workspace = true

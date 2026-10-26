@@ -1,4 +1,10 @@
 [package]
+description = "Traits and zero-copy types for file systems served over FUSE-style operations and volume APIs"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 name = "boxfs-api"
 version.workspace = true
 edition.workspace = true
