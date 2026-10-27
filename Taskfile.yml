@@ -8,7 +8,7 @@ vars:
   DIR: '{{.ROOT_DIR}}/target/juicefs'
   ARCHIVE: '{{.DIR}}/libjuicefs-{{.HOST_RUST_OS}}-{{.HOST_RUST_ARCH}}.a'
   # Every target a release ships.
-  TARGETS: x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc
+  TARGETS: x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-linux-android
 
 tasks:
   check:
@@ -32,9 +32,11 @@ tasks:
 
   juicefs:
     desc: "Install the JuiceFS c-archive that boxfs-juicefs links into target/juicefs"
+    vars:
+      TARGET_OS: '{{default OS .TARGET_OS}}'
     cmds:
-      # Linux builds in the container: its `cc` is musl's, which the archive needs.
-      - cmd: docker build --target artifact --output 'type=local,dest={{.DIR}}' crates/juicefs
+      # Linux and Android build in the container: Linux for musl's `cc`, Android for the NDK's.
+      - cmd: docker build --build-arg TARGET_OS={{.TARGET_OS}} --target artifact --output 'type=local,dest={{.DIR}}' crates/juicefs
         platforms: [linux]
       # macOS and Windows build on the host, with cgo's own C compiler.
       - cmd: |

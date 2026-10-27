@@ -184,9 +184,12 @@ fn link(archive: Option<&Path>, lib: &str, target_os: &str) {
 
 	// On musl these are all in libc, and Rust links it statically for musl
 	// targets, so naming them there would only look for files that do not exist.
+	// Android's Bionic is the same story for `pthread`: it lives in libc, and
+	// there is no `libpthread.so` to name. `libdl` and `libm` do exist there.
 	let system: &[&str] = match target_os {
 		"linux" if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl") => &[],
 		"linux" => &["pthread", "dl", "m"],
+		"android" => &["dl", "m"],
 		// Go's `crypto/x509` reaches into these on macOS.
 		"macos" => &["framework=Security", "framework=CoreFoundation"],
 		// Go's Windows runtime and cgo's MinGW objects call into these directly;
