@@ -20,6 +20,9 @@ jobs:
             asset: linux-x86_64
           - runs-on: ubuntu-26.04-arm
             asset: linux-aarch64
+          - runs-on: ubuntu-26.04
+            asset: android-aarch64
+            target_os: android
           - runs-on: macos-26
             asset: macos-aarch64
           - runs-on: windows-2025
@@ -75,7 +78,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$short"
 
       - name: Build juicefs
-        run: task juicefs
+        run: task juicefs ${{ matrix.target_os && format('TARGET_OS={0}', matrix.target_os) || '' }}
 
       - uses: actions/upload-artifact@v7
         with:

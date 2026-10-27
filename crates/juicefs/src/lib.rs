@@ -182,7 +182,10 @@ fn strings<I: IntoIterator<Item = std::ffi::OsString>>(values: I) -> Vec<*mut c_
 /// `AT_NULL` pair. Read from the process's own, so the page size and the other
 /// entries are the loader's rather than a guess. A host without `/proc` gets
 /// the terminator alone, which leaves Go to its own fallback.
-#[cfg(target_os = "linux")]
+///
+/// Android is Linux here: Bionic's loader writes the same `/proc/self/auxv`,
+/// and Go's `android` runtime reads the vector the same way `linux` does.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn auxv() -> Vec<*mut c_char> {
 	let Ok(bytes) = std::fs::read("/proc/self/auxv") else {
 		return vec![std::ptr::null_mut(); 2];

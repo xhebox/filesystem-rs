@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 publish = true
 license = "MIT"
@@ -12,7 +12,7 @@ keywords = ["filesystem", "fuse", "vfs", "storage"]
 categories = ["filesystem"]
 
 [workspace.dependencies]
-api = { package = "boxfs-api", version = "0.1.4", path = "crates/api" }
+api = { package = "boxfs-api", version = "0.1.5", path = "crates/api" }
 asyncband = { version = "0.7.3", features = ["oneshot"] }
 completion = { package = "completion-async", version = "0.2" }
 fs-core = { package = "rust-fs-core", version = "0.3.15" }

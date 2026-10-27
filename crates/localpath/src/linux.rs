@@ -1909,7 +1909,14 @@ fn remove_xattr(file: &File, name: &CStr) -> io::Result<()> {
 }
 
 fn errno_clear() {
-	unsafe { *libc::__errno_location() = 0 };
+	#[cfg(target_os = "linux")]
+	unsafe {
+		*libc::__errno_location() = 0;
+	}
+	#[cfg(target_os = "android")]
+	unsafe {
+		*libc::__errno() = 0;
+	}
 }
 
 fn statfs(file: &File) -> io::Result<Kstatfs> {
@@ -2142,19 +2149,9 @@ fn clone_file_data(src: &File, dst: &File, len: u64) -> io::Result<()> {
 	let mut remaining = len;
 	while remaining > 0 {
 		let chunk = remaining.min(1 << 30) as usize;
-		let copied = unsafe {
-			libc::copy_file_range(
-				src.as_raw_fd(),
-				std::ptr::null_mut(),
-				dst.as_raw_fd(),
-				std::ptr::null_mut(),
-				chunk,
-				0,
-			)
-		};
-		if copied < 0 {
+		let Ok(copied) = rustix::fs::copy_file_range(src, None, dst, None, chunk) else {
 			return copy_file_fallback(src, dst, len);
-		}
+		};
 		if copied == 0 {
 			break;
 		}

@@ -1,19 +1,21 @@
-# The JuiceFS c-archive boxfs-juicefs links, for Linux. Build it with this directory
-# as the context:
+# The JuiceFS c-archive boxfs-juicefs links, for Linux and Android. Build it
+# with this directory as the context:
 #
 #   docker build --target artifact --output type=local,dest=DIR crates/juicefs
 #
-# writes libjuicefs-linux-<arch>.a into DIR, under the name boxfs-juicefs's build.rs
-# looks for. Nothing else is written to the host.
-#
-# The build stage is Alpine, whose `cc` is musl's: the archive is linked into a
-# musl-static binary, and cgo's C half (SQLite included) has to be the same libc
-# as the rest of the process.
+# writes libjuicefs-linux-<arch>.a into DIR (or libjuicefs-android-aarch64.a
+# with `--build-arg TARGET_OS=android`), under the name boxfs-juicefs's
+# build.rs looks for. Nothing else is written to the host.
 #
 # Go's module and build caches are BuildKit cache mounts, so after an edit only
 # what changed is compiled again.
 
-FROM golang:1.25-alpine AS build
+ARG TARGET_OS=linux
+
+# The Linux build stage is Alpine, whose `cc` is musl's: the archive is linked
+# into a musl-static binary, and cgo's C half (SQLite included) has to be the
+# same libc as the rest of the process.
+FROM golang:1.25-alpine AS build-linux
 RUN apk add --no-cache build-base binutils
 
 WORKDIR /src
@@ -43,6 +45,42 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 		/out/juicefs.o \
 	&& ar rcs "/out/libjuicefs-linux-$(uname -m).a" /out/juicefs.o
 
+# Go's platform table rejects `-buildmode=c-archive` for `GOOS=android` and
+# hardcodes Bionic's single `TLS_SLOT_APP` slot for `runtime.tls_g`. Building
+# as `GOOS=linux GOARCH=arm64` with the Android NDK's clang and LLVM binutils
+# emits a standard ELF `.tbss` archive whose C half targets Bionic.
+FROM golang:1.25-bookworm AS build-android
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -O /tmp/ndk.zip \
+	&& unzip -q /tmp/ndk.zip -d / \
+	&& mv /android-ndk-r26d /android-ndk \
+	&& rm /tmp/ndk.zip
+ENV PATH="/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+
+WORKDIR /src
+COPY binding .
+RUN --mount=type=cache,target=/go/pkg/mod \
+	--mount=type=cache,target=/root/.cache/go-build \
+	ln -sf /android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar /usr/local/bin/ar \
+	&& mkdir -p /out \
+	&& CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+		CC=aarch64-linux-android34-clang \
+		AR=llvm-ar \
+		go build -buildmode=c-archive -trimpath \
+		-ldflags="-w -X=runtime.godebugDefault=asyncpreemptoff=1" \
+		-tags=netgo,osusergo,nogspt -o /out/libjuicefs.a . \
+	&& llvm-objcopy --remove-section=.init_array \
+		--redefine-sym "_rt0_arm64_linux_lib=juicefs_rt0" \
+		/out/libjuicefs.a \
+	&& ld.lld -r --whole-archive /out/libjuicefs.a -o /out/juicefs.o \
+	&& llvm-objcopy --strip-debug --globalize-symbol=juicefs_rt0 \
+		--wildcard --keep-global-symbol='juicefs_*' \
+		/out/juicefs.o \
+	&& llvm-ar rcs /out/libjuicefs-android-aarch64.a /out/juicefs.o
+
+FROM build-${TARGET_OS} AS selected
+
 # The last stage is what --output exports, so it holds only the archive.
 FROM scratch AS artifact
-COPY --from=build /out/libjuicefs-*.a /
+COPY --from=selected /out/libjuicefs-*.a /

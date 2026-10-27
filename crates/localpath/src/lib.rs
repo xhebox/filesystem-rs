@@ -10,13 +10,18 @@
 //! Each supported host OS has its own self-contained module (`linux`,
 //! `macos`, `windows`); on other targets the crate is empty.
 
-#![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#![cfg(any(
+	target_os = "linux",
+	target_os = "android",
+	target_os = "macos",
+	target_os = "windows"
+))]
 
 mod abi;
 mod span;
 
 std::cfg_select! {
-	target_os = "linux" => {
+	any(target_os = "linux", target_os = "android") => {
 		mod linux;
 		use linux as imp;
 	}
