@@ -45,10 +45,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 		/out/juicefs.o \
 	&& ar rcs "/out/libjuicefs-linux-$(uname -m).a" /out/juicefs.o
 
-# Go's platform table rejects `-buildmode=c-archive` for `GOOS=android` and
-# hardcodes Bionic's single `TLS_SLOT_APP` slot for `runtime.tls_g`. Building
-# as `GOOS=linux GOARCH=arm64` with the Android NDK's clang and LLVM binutils
-# emits a standard ELF `.tbss` archive whose C half targets Bionic.
+# Go's platform table rejects `-buildmode=c-archive` for `GOOS=android`, so the
+# archive is built as `GOOS=linux GOARCH=arm64` with the Android NDK's clang and
+# LLVM binutils. An overlay switches `runtime/tls_arm64.s` onto its Android
+# `TLS_SLOT_APP` branch (`DATA runtime.tls_g = 16`, `NOPTR`) so the archive
+# carries no initial-exec `.tbss` relocations that Bionic's `dlopen` rejects.
 FROM golang:1.25-bookworm AS build-android
 RUN apt-get update && apt-get install -y --no-install-recommends unzip \
 	&& rm -rf /var/lib/apt/lists/* \
@@ -63,11 +64,15 @@ COPY binding .
 RUN --mount=type=cache,target=/go/pkg/mod \
 	--mount=type=cache,target=/root/.cache/go-build \
 	ln -sf /android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar /usr/local/bin/ar \
+	&& sed -e 's/#ifdef TLSG_IS_VARIABLE/#ifdef GOOS_linux/' \
+		-e 's/#ifdef GOOS_android/#ifdef GOOS_linux/' \
+		/usr/local/go/src/runtime/tls_arm64.s > /tmp/tls_arm64.s \
+	&& printf '{"Replace":{"/usr/local/go/src/runtime/tls_arm64.s":"/tmp/tls_arm64.s"}}\n' > /tmp/overlay.json \
 	&& mkdir -p /out \
 	&& CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
 		CC=aarch64-linux-android34-clang \
 		AR=llvm-ar \
-		go build -buildmode=c-archive -trimpath \
+		go build -overlay=/tmp/overlay.json -buildmode=c-archive -trimpath \
 		-ldflags="-w -X=runtime.godebugDefault=asyncpreemptoff=1" \
 		-tags=netgo,osusergo,nogspt -o /out/libjuicefs.a . \
 	&& llvm-objcopy --remove-section=.init_array \
