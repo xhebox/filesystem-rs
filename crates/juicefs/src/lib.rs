@@ -31,17 +31,19 @@
 //! whole of a blocking read or write even when the future that started it is
 //! dropped: the buffer moves into the closure with the call.
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::io;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use api::{
-	Context, CreateArgs, DirentInfo, Fuse, GetxattrReply, Kstatfs, ListxattrReply, Snapshot,
-	Volume as VolumeApi, ZeroCopyReader, ZeroCopyWriter,
+	Context, CreateArgs, DiffEntry, DiffKind, DirentInfo, Fuse, GetxattrReply, Kstatfs,
+	ListxattrReply, Snapshot, Volume as VolumeApi, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
+	name_to_path,
 };
 use asyncband::oneshot;
 
@@ -1515,6 +1517,361 @@ fn sync_resolve_parent(handle: usize, ctx: &Ctx, path: &Path) -> io::Result<(u64
 	Ok((parent, name))
 }
 
+fn sync_walk(handle: usize, ctx: &Ctx, root: &Path) -> io::Result<Vec<WalkEntry>> {
+	let parts = split_path(root)?;
+	let root_ino = sync_resolve_dir(handle, ctx, &parts)?;
+	let mut out = Vec::new();
+	let mut pending = vec![(root_ino, PathBuf::new())];
+	while let Some((dir, relative)) = pending.pop() {
+		for entry in sync_readdir_all(handle, ctx, dir)? {
+			let path = relative.join(name_to_path(&entry.name)?);
+			out.push(WalkEntry {
+				path: path.clone(),
+				attr: wire_attr(entry.ino, &entry.attr),
+			});
+			if entry.attr.typ == TYPE_DIRECTORY {
+				pending.push((entry.ino, path));
+			}
+		}
+	}
+	out.sort_by(|a, b| a.path.cmp(&b.path));
+	Ok(out)
+}
+
+fn sync_read_range(
+	handle: usize,
+	ctx: &Ctx,
+	path: &Path,
+	offset: u64,
+	len: usize,
+) -> io::Result<Vec<u8>> {
+	let (parent, name) = sync_resolve_parent(handle, ctx, path)?;
+	let entry = sync_lookup(handle, ctx, parent, &name)?;
+	if entry.attr.typ == TYPE_DIRECTORY {
+		return Err(io::Error::from_raw_os_error(libc::EISDIR));
+	}
+	if entry.attr.typ != TYPE_REGULAR {
+		return Err(io::Error::from_raw_os_error(libc::EPERM));
+	}
+	let size = entry.attr.length;
+	if len == 0 || offset >= size {
+		return Ok(Vec::new());
+	}
+	let want = (size - offset).min(len as u64) as usize;
+	let mut opened = Entry::default();
+	let mut fh = 0u64;
+	check(unsafe {
+		binding::juicefs_open(
+			handle,
+			mut_ptr(ctx),
+			entry.ino,
+			libc::O_RDONLY as u32,
+			&mut opened,
+			&mut fh,
+		)
+	})?;
+	let mut buf = vec![0u8; want];
+	let mut read = 0usize;
+	let mut result = Ok(());
+	while read < want {
+		let mut got = 0usize;
+		let code = unsafe {
+			binding::juicefs_read(
+				handle,
+				mut_ptr(ctx),
+				entry.ino,
+				fh,
+				offset + read as u64,
+				buf[read..].as_mut_ptr().cast(),
+				want - read,
+				&mut got,
+			)
+		};
+		if let Err(error) = check(code) {
+			result = Err(error);
+			break;
+		}
+		let got = got.min(want - read);
+		if got == 0 {
+			break;
+		}
+		read += got;
+	}
+	unsafe { binding::juicefs_release(handle, mut_ptr(ctx), entry.ino, fh) };
+	result?;
+	buf.truncate(read);
+	Ok(buf)
+}
+
+fn sync_lookup_dir_optional(
+	handle: usize,
+	ctx: &Ctx,
+	start: u64,
+	parts: &[CString],
+) -> io::Result<Option<u64>> {
+	let mut current = start;
+	for part in parts {
+		let entry = match sync_lookup(handle, ctx, current, part) {
+			Ok(entry) => entry,
+			Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+			Err(error) => return Err(error),
+		};
+		if entry.attr.typ != TYPE_DIRECTORY {
+			return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+		}
+		current = entry.ino;
+	}
+	Ok(Some(current))
+}
+
+fn sync_collect_tree(
+	handle: usize,
+	ctx: &Ctx,
+	start: u64,
+	out: &mut BTreeMap<PathBuf, (u64, api::Attr)>,
+) -> io::Result<()> {
+	let mut pending = vec![(start, PathBuf::new())];
+	while let Some((dir, relative)) = pending.pop() {
+		for entry in sync_readdir_all(handle, ctx, dir)? {
+			let path = relative.join(name_to_path(&entry.name)?);
+			out.insert(path.clone(), (entry.ino, wire_attr(entry.ino, &entry.attr)));
+			if entry.attr.typ == TYPE_DIRECTORY {
+				pending.push((entry.ino, path));
+			}
+		}
+	}
+	Ok(())
+}
+
+fn sync_open_read(handle: usize, ctx: &Ctx, ino: u64) -> io::Result<u64> {
+	let mut opened = Entry::default();
+	let mut fh = 0u64;
+	check(unsafe {
+		binding::juicefs_open(
+			handle,
+			mut_ptr(ctx),
+			ino,
+			libc::O_RDONLY as u32,
+			&mut opened,
+			&mut fh,
+		)
+	})?;
+	Ok(fh)
+}
+
+fn sync_read_chunk(
+	handle: usize,
+	ctx: &Ctx,
+	ino: u64,
+	fh: u64,
+	offset: u64,
+	len: usize,
+) -> io::Result<Vec<u8>> {
+	let mut buf = vec![0u8; len];
+	let mut read = 0usize;
+	while read < len {
+		let mut got = 0usize;
+		check(unsafe {
+			binding::juicefs_read(
+				handle,
+				mut_ptr(ctx),
+				ino,
+				fh,
+				offset + read as u64,
+				buf[read..].as_mut_ptr().cast(),
+				len - read,
+				&mut got,
+			)
+		})?;
+		let got = got.min(len - read);
+		if got == 0 {
+			break;
+		}
+		read += got;
+	}
+	buf.truncate(read);
+	Ok(buf)
+}
+
+fn unexpected_eof(ino: u64) -> io::Error {
+	io::Error::new(
+		io::ErrorKind::UnexpectedEof,
+		format!("inode {ino} ended before its reported size"),
+	)
+}
+
+fn sync_files_equal(
+	handle: usize,
+	ctx: &Ctx,
+	left_ino: u64,
+	right_ino: u64,
+	size: u64,
+) -> io::Result<bool> {
+	let left_fh = sync_open_read(handle, ctx, left_ino)?;
+	let right_fh = match sync_open_read(handle, ctx, right_ino) {
+		Ok(fh) => fh,
+		Err(error) => {
+			unsafe { binding::juicefs_release(handle, mut_ptr(ctx), left_ino, left_fh) };
+			return Err(error);
+		}
+	};
+	let mut result = Ok(true);
+	let mut offset = 0u64;
+	while offset < size {
+		let want = (size - offset).min(64 * 1024) as usize;
+		let left = match sync_read_chunk(handle, ctx, left_ino, left_fh, offset, want) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				result = Err(error);
+				break;
+			}
+		};
+		let right = match sync_read_chunk(handle, ctx, right_ino, right_fh, offset, want) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				result = Err(error);
+				break;
+			}
+		};
+		if left != right {
+			result = Ok(false);
+			break;
+		}
+		if left.len() < want {
+			result = Err(unexpected_eof(left_ino));
+			break;
+		}
+		offset += want as u64;
+	}
+	unsafe {
+		binding::juicefs_release(handle, mut_ptr(ctx), left_ino, left_fh);
+		binding::juicefs_release(handle, mut_ptr(ctx), right_ino, right_fh);
+	}
+	result
+}
+
+fn sync_modified(
+	handle: usize,
+	ctx: &Ctx,
+	snapshot_ino: u64,
+	snapshot_attr: &api::Attr,
+	current_ino: u64,
+	current_attr: &api::Attr,
+) -> io::Result<bool> {
+	let snapshot_kind = snapshot_attr.mode & 0o170000;
+	let current_kind = current_attr.mode & 0o170000;
+	if snapshot_kind != current_kind {
+		return Ok(true);
+	}
+	match current_kind {
+		0o040000 => Ok(false),
+		0o100000 => {
+			if snapshot_attr.size != current_attr.size {
+				return Ok(true);
+			}
+			if snapshot_attr.size == 0 {
+				return Ok(false);
+			}
+			sync_files_equal(handle, ctx, snapshot_ino, current_ino, current_attr.size)
+				.map(|equal| !equal)
+		}
+		0o120000 => {
+			let snapshot_target = sync_readlink(handle, ctx, snapshot_ino)?;
+			let current_target = sync_readlink(handle, ctx, current_ino)?;
+			Ok(snapshot_target != current_target)
+		}
+		_ => Ok(snapshot_attr.rdev != current_attr.rdev),
+	}
+}
+
+fn sync_snapshot_root(handle: usize, ctx: &Ctx, id: u64) -> io::Result<u64> {
+	let pool = sync_lookup(handle, ctx, ROOT_INO, SNAPSHOT_DIR_NAME)?;
+	if pool.attr.typ != TYPE_DIRECTORY {
+		return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+	}
+	let snap_name = CString::new(format!("snap-{id}")).expect("no NUL");
+	let snapshot = sync_lookup(handle, ctx, pool.ino, &snap_name)?;
+	if snapshot.attr.typ != TYPE_DIRECTORY {
+		return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+	}
+	Ok(snapshot.ino)
+}
+
+fn sync_diff(handle: usize, ctx: &Ctx, id: u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
+	let snapshot_root = sync_snapshot_root(handle, ctx, id)?;
+	let parts = split_path(scope)?;
+	let snapshot_scope = sync_lookup_dir_optional(handle, ctx, snapshot_root, &parts)?;
+	let current_scope = sync_lookup_dir_optional(handle, ctx, ROOT_INO, &parts)?;
+	let snapshot_scope = match snapshot_scope {
+		Some(ino) => ino,
+		None => match current_scope {
+			None => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+			Some(current) => {
+				let mut entries = BTreeMap::new();
+				sync_collect_tree(handle, ctx, current, &mut entries)?;
+				return Ok(entries
+					.into_keys()
+					.map(|path| DiffEntry {
+						path,
+						kind: DiffKind::Added,
+					})
+					.collect());
+			}
+		},
+	};
+	let current_scope = match current_scope {
+		Some(ino) => ino,
+		None => {
+			let mut entries = BTreeMap::new();
+			sync_collect_tree(handle, ctx, snapshot_scope, &mut entries)?;
+			return Ok(entries
+				.into_keys()
+				.map(|path| DiffEntry {
+					path,
+					kind: DiffKind::Removed,
+				})
+				.collect());
+		}
+	};
+
+	let mut snapshot_entries = BTreeMap::new();
+	sync_collect_tree(handle, ctx, snapshot_scope, &mut snapshot_entries)?;
+	let mut current_entries = BTreeMap::new();
+	sync_collect_tree(handle, ctx, current_scope, &mut current_entries)?;
+	let mut diff = Vec::new();
+	for (path, (current_ino, current_attr)) in &current_entries {
+		match snapshot_entries.remove(path) {
+			None => diff.push(DiffEntry {
+				path: path.clone(),
+				kind: DiffKind::Added,
+			}),
+			Some((snapshot_ino, snapshot_attr)) => {
+				if sync_modified(
+					handle,
+					ctx,
+					snapshot_ino,
+					&snapshot_attr,
+					*current_ino,
+					current_attr,
+				)? {
+					diff.push(DiffEntry {
+						path: path.clone(),
+						kind: DiffKind::Modified,
+					});
+				}
+			}
+		}
+	}
+	for path in snapshot_entries.into_keys() {
+		diff.push(DiffEntry {
+			path,
+			kind: DiffKind::Removed,
+		});
+	}
+	diff.sort_by(|a, b| a.path.cmp(&b.path));
+	Ok(diff)
+}
+
 fn sync_copy_file(
 	handle: usize,
 	ctx: &Ctx,
@@ -2101,6 +2458,24 @@ impl VolumeApi for Volume {
 		.await
 	}
 
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		let path = path.to_path_buf();
+		self.call(move |handle| {
+			let ctx = Ctx::default();
+			sync_read_range(handle, &ctx, &path, offset, len)
+		})
+		.await
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		let root = root.to_path_buf();
+		self.call(move |handle| {
+			let ctx = Ctx::default();
+			sync_walk(handle, &ctx, &root)
+		})
+		.await
+	}
+
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		let path = path.to_path_buf();
 		let data = data.to_vec();
@@ -2399,6 +2774,16 @@ impl Snapshot for Volume {
 			let ctx = Ctx::default();
 			let pool_ino = sync_lookup(handle, &ctx, ROOT_INO, SNAPSHOT_DIR_NAME)?.ino;
 			sync_remove_subtree(handle, &ctx, pool_ino, &snap_name)
+		})
+		.await
+	}
+
+	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
+		let id = *id;
+		let scope = scope.to_path_buf();
+		self.call(move |handle| {
+			let ctx = Ctx::default();
+			sync_diff(handle, &ctx, id, &scope)
 		})
 		.await
 	}

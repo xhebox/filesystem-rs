@@ -31,8 +31,9 @@ use crate::abi::{
 };
 use crate::span::{engine_io, read_exact, read_into, write_into};
 use api::{
-	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
-	ListxattrReply, Snapshot, Volume, ZeroCopyReader, ZeroCopyWriter,
+	Attr, Context, CreateArgs, DiffEntry, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply,
+	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
+	diff_volumes,
 };
 
 const NO_CACHE: Timeout = (0, 0);
@@ -776,6 +777,51 @@ impl FsState {
 		fs::remove_dir_all(snap_path)
 	}
 
+	fn snapshot_root(&self, id: u64) -> io::Result<File> {
+		let pool = Arc::clone(self.pool()?);
+		let snap_path = pool.dir.join(format!("snap-{id}"));
+		if !snap_path.is_dir() {
+			return Err(errno(libc::ENOENT));
+		}
+		inspect_path(&snap_path)
+	}
+
+	fn volume_walk(&self, path: &Path) -> io::Result<Vec<WalkEntry>> {
+		let root = self.resolve_volume_path(path)?;
+		let metadata = fs::symlink_metadata(&root)?;
+		if metadata.file_type().is_symlink() || !metadata.is_dir() {
+			return Err(errno(libc::ENOTDIR));
+		}
+		let mut out = Vec::new();
+		let mut pending = vec![(root, PathBuf::new())];
+		while let Some((dir, relative)) = pending.pop() {
+			let mut names = Vec::new();
+			for item in fs::read_dir(&dir)? {
+				let name = item?.file_name();
+				validate_component(name.as_encoded_bytes())?;
+				names.push(name);
+			}
+			names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
+			for name in names {
+				let child_path = dir.join(&name);
+				let metadata = fs::symlink_metadata(&child_path)?;
+				let file = inspect_path(&child_path)?;
+				let (_, ino) = file_identity(&file)?;
+				let nlink = file_nlink(&file).unwrap_or(1);
+				let child = relative.join(&name);
+				out.push(WalkEntry {
+					path: child.clone(),
+					attr: Self::wire_attr(ino, &metadata, nlink),
+				});
+				if metadata.is_dir() && !metadata.file_type().is_symlink() {
+					pending.push((child_path, child));
+				}
+			}
+		}
+		out.sort_by(|a, b| a.path.cmp(&b.path));
+		Ok(out)
+	}
+
 	fn resolve_volume_path(&self, path: &Path) -> io::Result<PathBuf> {
 		let mut current = self.node(ROOT_ID)?.path.clone();
 		let parts = split_path(path)?;
@@ -1157,6 +1203,15 @@ impl Snapshot for PassthroughFs {
 	async fn delete(&self, id: &u64) -> io::Result<()> {
 		self.with(|state| state.delete_snapshot(*id))
 	}
+
+	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
+		let snapshot = {
+			let state = self.state.borrow();
+			let root = state.snapshot_root(*id)?;
+			PassthroughFs::new(root, true)?
+		};
+		diff_volumes(&snapshot, self, scope).await
+	}
 }
 
 impl Volume for PassthroughFs {
@@ -1168,6 +1223,21 @@ impl Volume for PassthroughFs {
 		let mut buffer = completion::Buffer::zeroed(len);
 		let count = read_exact(&file, buffer.clone(), 0).await?;
 		Ok(buffer.get_mut().expect("the read landed")[..count].to_vec())
+	}
+
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		let (file, size) = self.with(|state| state.open_volume_read(path))?;
+		let cap = (size as u64).saturating_sub(offset).min(len as u64) as usize;
+		if cap == 0 {
+			return Ok(Vec::new());
+		}
+		let mut buffer = completion::Buffer::zeroed(cap);
+		let count = read_exact(&file, buffer.clone(), offset).await?;
+		Ok(buffer.get_mut().expect("the read landed")[..count].to_vec())
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		self.with(|state| state.volume_walk(root))
 	}
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {

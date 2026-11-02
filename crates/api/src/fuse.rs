@@ -31,7 +31,8 @@ pub struct DirEntry {
 	pub offset: u64,
 	/// Entry type (an `FUSE_DT_*` value, which matches `DT_*`).
 	pub type_: u32,
-	/// Name, without separators.
+	/// Name without separators: raw bytes on Unix, UTF-8 elsewhere.
+	/// Convert with [`name_to_path`](crate::name_to_path).
 	pub name: Vec<u8>,
 }
 

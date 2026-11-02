@@ -1,7 +1,5 @@
-//! The interfaces a file-system or volume back-end implements: [`Fuse`] for
-//! FUSE transports (such as virtio-fs), [`Volume`] for path-addressed
-//! host/agent access, and [`Snapshot`] for point-in-time snapshots and
-//! branches.
+//! [`Fuse`] transport operations, path-addressed [`Volume`] access, and
+//! [`Snapshot`] lifecycle and diff operations.
 
 mod fuse;
 mod memory;
@@ -13,5 +11,5 @@ pub use fuse::{
 	ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
 };
 pub use memory::{Memory, MemoryRange};
-pub use snapshot::Snapshot;
-pub use volume::Volume;
+pub use snapshot::{DiffEntry, DiffKind, Snapshot, diff_volumes};
+pub use volume::{Volume, WalkEntry, name_to_path};

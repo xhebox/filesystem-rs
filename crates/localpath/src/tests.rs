@@ -3,7 +3,8 @@
 	reason = "the tests drive one request at a time on this thread, and nothing else borrows the state meanwhile"
 )]
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use api::{Attr, Context, Fuse, Memory, MemoryRange, Snapshot, Volume, ZeroCopyWriter};
+use api::{Attr, Context, DiffKind, Fuse, Memory, MemoryRange, Snapshot, Volume, ZeroCopyWriter};
 use completion::AsIoVec;
 
 use crate::PassthroughFs;
@@ -62,6 +63,11 @@ fn root() -> (Scratch, PathBuf, File) {
 	fs::create_dir(&path).unwrap();
 	let file = OpenOptions::new().read(true).open(&path).unwrap();
 	(dir, path, file)
+}
+
+/// Runs a future, unwrapping the executor result.
+fn run<F: Future>(future: F) -> F::Output {
+	completion::block_on(future).unwrap()
 }
 
 #[test]
@@ -703,6 +709,209 @@ fn snapshot_branch_restore_and_delete() {
 			.raw_os_error(),
 		Some(libc::ENOENT)
 	);
+}
+
+#[test]
+fn volume_walk_is_sorted_relative_and_does_not_follow_symlinks() {
+	let (_dir, path, root) = root();
+	fs::create_dir(path.join("sub")).unwrap();
+	fs::write(path.join("readme"), b"read").unwrap();
+	fs::write(path.join("sub/nested"), b"nested").unwrap();
+	symlink("sub", path.join("link")).unwrap();
+	let fs = filesystem(root, false);
+
+	let entries = run(Volume::walk(&fs, Path::new("/"))).unwrap();
+	let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+	assert_eq!(
+		paths,
+		vec![
+			PathBuf::from("link"),
+			PathBuf::from("readme"),
+			PathBuf::from("sub"),
+			PathBuf::from("sub/nested"),
+		]
+	);
+	assert!(!paths.contains(&PathBuf::from("link/nested")));
+	let link = entries
+		.iter()
+		.find(|entry| entry.path == Path::new("link"))
+		.unwrap();
+	assert_eq!(link.attr.mode & 0o170000, 0o120000);
+	let nested = entries
+		.iter()
+		.find(|entry| entry.path == Path::new("sub/nested"))
+		.unwrap();
+	assert_eq!(nested.attr.size, 6);
+
+	let scoped = run(Volume::walk(&fs, Path::new("sub"))).unwrap();
+	assert_eq!(scoped.len(), 1);
+	assert_eq!(scoped[0].path, PathBuf::from("nested"));
+
+	assert_eq!(
+		run(Volume::walk(&fs, Path::new("/missing")))
+			.unwrap_err()
+			.raw_os_error(),
+		Some(libc::ENOENT)
+	);
+	assert_eq!(
+		run(Volume::walk(&fs, Path::new("/readme")))
+			.unwrap_err()
+			.raw_os_error(),
+		Some(libc::ENOTDIR)
+	);
+	assert_eq!(
+		run(Volume::walk(&fs, Path::new("/link")))
+			.unwrap_err()
+			.raw_os_error(),
+		Some(libc::ENOTDIR)
+	);
+	let again = run(Volume::walk(&fs, Path::new("/"))).unwrap();
+	assert_eq!(
+		again
+			.iter()
+			.map(|entry| entry.path.clone())
+			.collect::<Vec<_>>(),
+		paths
+	);
+}
+
+#[test]
+fn volume_read_range_is_bounded_at_eof_and_never_overflows() {
+	let (_dir, path, root) = root();
+	fs::create_dir(path.join("dir")).unwrap();
+	fs::write(path.join("text"), b"0123456789").unwrap();
+	symlink("text", path.join("link")).unwrap();
+	let fs = filesystem(root, false);
+
+	assert_eq!(
+		run(Volume::read_range(&fs, Path::new("/text"), 0, 4)).unwrap(),
+		b"0123"
+	);
+	assert_eq!(
+		run(Volume::read_range(&fs, Path::new("/text"), 6, 100)).unwrap(),
+		b"6789"
+	);
+	assert!(
+		run(Volume::read_range(&fs, Path::new("/text"), 10, 4))
+			.unwrap()
+			.is_empty()
+	);
+	assert!(
+		run(Volume::read_range(&fs, Path::new("/text"), u64::MAX, 4))
+			.unwrap()
+			.is_empty()
+	);
+	assert!(
+		run(Volume::read_range(&fs, Path::new("/text"), 3, 0))
+			.unwrap()
+			.is_empty()
+	);
+	assert_eq!(
+		run(Volume::read_range(&fs, Path::new("/text"), 2, usize::MAX)).unwrap(),
+		b"23456789"
+	);
+	assert_eq!(
+		run(Volume::read_range(&fs, Path::new("/missing"), 0, 1))
+			.unwrap_err()
+			.raw_os_error(),
+		Some(libc::ENOENT)
+	);
+	assert_eq!(
+		run(Volume::read_range(&fs, Path::new("/dir"), 0, 1))
+			.unwrap_err()
+			.raw_os_error(),
+		Some(libc::EISDIR)
+	);
+	assert_eq!(
+		run(Volume::read_range(&fs, Path::new("/link"), 0, 1))
+			.unwrap_err()
+			.raw_os_error(),
+		Some(libc::ELOOP)
+	);
+}
+
+#[test]
+fn snapshot_diff_compares_content_and_copied_trees() {
+	let (dir, path, root) = root();
+	let pool_path = dir.path().join("snapshots");
+	fs::create_dir(&pool_path).unwrap();
+	let pool = OpenOptions::new().read(true).open(&pool_path).unwrap();
+	let fs = PassthroughFs::with_snapshots(root, pool, false).unwrap();
+
+	fs::create_dir(path.join("sub")).unwrap();
+	fs::write(path.join("keep"), b"keep").unwrap();
+	fs::write(path.join("edit"), b"AAAA").unwrap();
+	fs::write(path.join("remove"), b"gone").unwrap();
+	fs::write(path.join("kind"), b"file").unwrap();
+	fs::write(path.join("sub/nested"), b"one!").unwrap();
+	fs::write(path.join("sub/removed"), b"old!").unwrap();
+	symlink("keep", path.join("link")).unwrap();
+	let snapshot = run(fs.snapshot()).unwrap();
+
+	// Detect same-size edits with unchanged mtime; ignore copied inode/ctime.
+	let original_mtime = fs::metadata(path.join("edit")).unwrap().modified().unwrap();
+	fs::write(path.join("edit"), b"BBBB").unwrap();
+	OpenOptions::new()
+		.write(true)
+		.open(path.join("edit"))
+		.unwrap()
+		.set_times(FileTimes::new().set_modified(original_mtime))
+		.unwrap();
+	fs::write(path.join("sub/nested"), b"two!").unwrap();
+	fs::write(path.join("add"), b"new").unwrap();
+	fs::write(path.join("sub/added"), b"new").unwrap();
+	fs::remove_file(path.join("remove")).unwrap();
+	fs::remove_file(path.join("sub/removed")).unwrap();
+	fs::remove_file(path.join("kind")).unwrap();
+	fs::create_dir(path.join("kind")).unwrap();
+	fs::write(path.join("kind/child"), b"x").unwrap();
+	fs::remove_file(path.join("link")).unwrap();
+	symlink("add", path.join("link")).unwrap();
+
+	let diff = run(fs.diff(&snapshot, Path::new("/"))).unwrap();
+	let changed: Vec<(PathBuf, DiffKind)> = diff
+		.into_iter()
+		.map(|entry| (entry.path, entry.kind))
+		.collect();
+	assert_eq!(
+		changed,
+		vec![
+			(PathBuf::from("add"), DiffKind::Added),
+			(PathBuf::from("edit"), DiffKind::Modified),
+			(PathBuf::from("kind"), DiffKind::Modified),
+			(PathBuf::from("kind/child"), DiffKind::Added),
+			(PathBuf::from("link"), DiffKind::Modified),
+			(PathBuf::from("remove"), DiffKind::Removed),
+			(PathBuf::from("sub/added"), DiffKind::Added),
+			(PathBuf::from("sub/nested"), DiffKind::Modified),
+			(PathBuf::from("sub/removed"), DiffKind::Removed),
+		]
+	);
+
+	let scoped = run(fs.diff(&snapshot, Path::new("sub"))).unwrap();
+	assert_eq!(
+		scoped
+			.into_iter()
+			.map(|entry| (entry.path, entry.kind))
+			.collect::<Vec<_>>(),
+		vec![
+			(PathBuf::from("added"), DiffKind::Added),
+			(PathBuf::from("nested"), DiffKind::Modified),
+			(PathBuf::from("removed"), DiffKind::Removed),
+		]
+	);
+
+	// The snapshot remains unchanged.
+	let branched = run(fs.branch(&snapshot)).unwrap();
+	assert_eq!(
+		run(Volume::read(&branched, Path::new("/edit"))).unwrap(),
+		b"AAAA"
+	);
+	assert!(run(fs.diff(&snapshot, Path::new("/missing"))).is_err());
+	assert!(run(fs.diff(&999, Path::new("/"))).is_err());
+
+	run(fs.restore(&snapshot)).unwrap();
+	assert!(run(fs.diff(&snapshot, Path::new("/"))).unwrap().is_empty());
 }
 
 #[test]
