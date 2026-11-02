@@ -31,13 +31,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,8 +48,9 @@ use crate::abi::{
 };
 use crate::span::{engine_io, read_exact, read_into, write_into};
 use api::{
-	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
-	ListxattrReply, Snapshot, Volume, ZeroCopyReader, ZeroCopyWriter,
+	Attr, Context, CreateArgs, DiffEntry, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply,
+	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
+	diff_volumes,
 };
 
 /// Zero attribute/data timeouts: nothing the guest caches may outlive the
@@ -998,6 +999,12 @@ impl FsState {
 		remove_tree(&pool.dir, &snap_name)
 	}
 
+	fn snapshot_root(&self, id: u64) -> io::Result<File> {
+		let pool = Arc::clone(self.pool()?);
+		let snap_name = snapshot_entry_name("snap", id);
+		open_dir_fd(pool.dir.as_raw_fd(), &snap_name)
+	}
+
 	fn resolve_dir(&self, parts: &[CString]) -> io::Result<File> {
 		let mut dir = open_dir_fd(self.node(ROOT_ID)?.file.as_raw_fd(), c".")?;
 		for part in parts {
@@ -1045,6 +1052,43 @@ impl FsState {
 			0o644,
 		)?;
 		Ok(completion::File::new(file))
+	}
+
+	fn volume_walk(&self, path: &Path) -> io::Result<Vec<WalkEntry>> {
+		let parts = split_path(path)?;
+		let root = if parts.is_empty() {
+			open_dir_fd(self.node(ROOT_ID)?.file.as_raw_fd(), c".")?
+		} else {
+			let (parent, name) = self.resolve_parent(path)?;
+			if !inspect_name(parent.as_raw_fd(), &name)?
+				.metadata()?
+				.is_dir()
+			{
+				return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+			}
+			open_dir_fd(parent.as_raw_fd(), &name)?
+		};
+		let mut out = Vec::new();
+		let mut pending = vec![(root, PathBuf::new())];
+		while let Some((dir, relative)) = pending.pop() {
+			let mut names = list_dir_names(&dir)?;
+			names.sort_by(|a, b| a.to_bytes().cmp(b.to_bytes()));
+			for name in names {
+				let file = inspect_name(dir.as_raw_fd(), &name)?;
+				let metadata = file.metadata()?;
+				let child = relative.join(PathBuf::from(OsStr::from_bytes(name.to_bytes())));
+				out.push(WalkEntry {
+					path: child.clone(),
+					attr: Self::wire_attr(metadata.ino(), &metadata),
+				});
+				if metadata.is_dir() {
+					let child_dir = open_dir_fd(dir.as_raw_fd(), &name)?;
+					pending.push((child_dir, child));
+				}
+			}
+		}
+		out.sort_by(|a, b| a.path.cmp(&b.path));
+		Ok(out)
 	}
 
 	fn volume_stat(&self, path: &Path) -> io::Result<Attr> {
@@ -1569,6 +1613,15 @@ impl Snapshot for PassthroughFs {
 	async fn delete(&self, id: &u64) -> io::Result<()> {
 		self.with(|state| state.delete_snapshot(*id))
 	}
+
+	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
+		let snapshot = {
+			let state = self.state.borrow();
+			let root = state.snapshot_root(*id)?;
+			PassthroughFs::new(root, true)?
+		};
+		diff_volumes(&snapshot, self, scope).await
+	}
 }
 
 impl Volume for PassthroughFs {
@@ -1580,6 +1633,21 @@ impl Volume for PassthroughFs {
 		let mut buffer = completion::Buffer::zeroed(len);
 		let count = read_exact(&file, buffer.clone(), 0).await?;
 		Ok(buffer.get_mut().expect("the read landed")[..count].to_vec())
+	}
+
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		let (file, size) = self.with(|state| state.open_volume_read(path))?;
+		let cap = (size as u64).saturating_sub(offset).min(len as u64) as usize;
+		if cap == 0 {
+			return Ok(Vec::new());
+		}
+		let mut buffer = completion::Buffer::zeroed(cap);
+		let count = read_exact(&file, buffer.clone(), offset).await?;
+		Ok(buffer.get_mut().expect("the read landed")[..count].to_vec())
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		self.with(|state| state.volume_walk(root))
 	}
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {

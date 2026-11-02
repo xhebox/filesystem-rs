@@ -8,12 +8,12 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use api::{
 	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
-	ListxattrReply, Volume, ZeroCopyReader, ZeroCopyWriter,
+	ListxattrReply, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter, name_to_path,
 };
 pub use fs_core::BlockRead;
 use fs_core::FileDevice;
@@ -207,6 +207,34 @@ impl Erofs {
 			}
 		}
 		Ok(current)
+	}
+
+	fn volume_walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		let root_inode = self.resolve_path(root)?;
+		if !root_inode.is_dir() {
+			return Err(errno(libc::ENOTDIR));
+		}
+		let mut out = Vec::new();
+		let mut pending = vec![(root_inode, PathBuf::new())];
+		while let Some((dir, relative)) = pending.pop() {
+			let raw = self.inner.read_dir(&dir).map_err(erofs_io)?;
+			for item in raw
+				.into_iter()
+				.filter(|entry| entry.name != b"." && entry.name != b"..")
+			{
+				let child = self.inner.read_inode(item.nid).map_err(erofs_io)?;
+				let path = relative.join(name_to_path(&item.name)?);
+				out.push(WalkEntry {
+					path: path.clone(),
+					attr: self.wire_attr(&child),
+				});
+				if child.is_dir() {
+					pending.push((child, path));
+				}
+			}
+		}
+		out.sort_by(|a, b| a.path.cmp(&b.path));
+		Ok(out)
 	}
 
 	fn read_dir_entries(&self, nid: u64, offset: u64, max: usize) -> io::Result<Vec<DirEntry>> {
@@ -695,6 +723,28 @@ impl Volume for Erofs {
 		Ok(buf)
 	}
 
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		let node = self.resolve_path(path)?;
+		if node.is_dir() {
+			return Err(errno(libc::EISDIR));
+		}
+		if !node.is_regular_file() {
+			return Err(errno(libc::EPERM));
+		}
+		let cap = node.size.saturating_sub(offset).min(len as u64) as usize;
+		let mut buf = vec![0u8; cap];
+		if cap > 0 {
+			self.inner
+				.read_file(&node, offset, &mut buf)
+				.map_err(erofs_io)?;
+		}
+		Ok(buf)
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		self.volume_walk(root)
+	}
+
 	async fn write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
 		Err(errno(libc::EROFS))
 	}
@@ -951,6 +1001,111 @@ mod tests {
 		assert_eq!(
 			names,
 			vec![b"hello.txt".to_vec(), b"link".to_vec(), b"sub".to_vec()]
+		);
+	}
+
+	#[test]
+	fn walk_is_relative_sorted_and_never_follows_symlinks() {
+		let fs = sample_erofs();
+		let entries = block_on(Volume::walk(&fs, Path::new("/"))).unwrap();
+		let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+		assert_eq!(
+			paths,
+			vec![
+				PathBuf::from("hello.txt"),
+				PathBuf::from("link"),
+				PathBuf::from("sub"),
+				PathBuf::from("sub/nested.txt"),
+			]
+		);
+		assert!(!paths.contains(&PathBuf::from("link/nested.txt")));
+		let link = entries
+			.iter()
+			.find(|entry| entry.path == Path::new("link"))
+			.unwrap();
+		assert_eq!(link.attr.mode & 0o170000, 0o120000);
+
+		let scoped = block_on(Volume::walk(&fs, Path::new("sub"))).unwrap();
+		assert_eq!(scoped.len(), 1);
+		assert_eq!(scoped[0].path, PathBuf::from("nested.txt"));
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/missing")))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOENT)
+		);
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/hello.txt")))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOTDIR)
+		);
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/link")))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOTDIR)
+		);
+	}
+
+	#[test]
+	fn read_range_is_bounded_at_eof_and_never_overflows() {
+		let fs = sample_erofs();
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/hello.txt"), 0, 5)).unwrap(),
+			b"hello"
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/hello.txt"), 6, 100)).unwrap(),
+			b"erofs"
+		);
+		assert!(
+			block_on(Volume::read_range(&fs, Path::new("/hello.txt"), 11, 4))
+				.unwrap()
+				.is_empty()
+		);
+		assert!(
+			block_on(Volume::read_range(
+				&fs,
+				Path::new("/hello.txt"),
+				u64::MAX,
+				4
+			))
+			.unwrap()
+			.is_empty()
+		);
+		assert!(
+			block_on(Volume::read_range(&fs, Path::new("/hello.txt"), 3, 0))
+				.unwrap()
+				.is_empty()
+		);
+		assert_eq!(
+			block_on(Volume::read_range(
+				&fs,
+				Path::new("/hello.txt"),
+				2,
+				usize::MAX
+			))
+			.unwrap(),
+			b"llo erofs"
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/missing"), 0, 1))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOENT)
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/sub"), 0, 1))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::EISDIR)
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/link"), 0, 1))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::EPERM)
 		);
 	}
 

@@ -16,13 +16,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use api::{
-	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
-	ListxattrReply, Snapshot, Volume, ZeroCopyReader, ZeroCopyWriter,
+	Attr, Context, CreateArgs, DiffEntry, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply,
+	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
+	diff_volumes, name_to_path,
 };
 use imbl::{HashMap as ImHashMap, OrdMap, Vector};
 
@@ -902,6 +903,32 @@ impl FsState {
 		Ok((parent, name))
 	}
 
+	fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		let parts = split_path(root)?;
+		let root_ino = self.resolve_dir(&parts)?;
+		let mut out = Vec::new();
+		let mut pending = vec![(root_ino, PathBuf::new())];
+		while let Some((ino, relative)) = pending.pop() {
+			let node = self.tree.node(ino)?;
+			let NodeKind::Dir { entries, .. } = &node.kind else {
+				continue;
+			};
+			for (name, &child_ino) in entries {
+				let child = self.tree.node(child_ino)?;
+				let path = relative.join(name_to_path(name)?);
+				if child.is_dir() {
+					pending.push((child_ino, path.clone()));
+				}
+				out.push(WalkEntry {
+					path,
+					attr: child.attr,
+				});
+			}
+		}
+		out.sort_by(|a, b| a.path.cmp(&b.path));
+		Ok(out)
+	}
+
 	fn remove_subtree(&mut self, parent: Inode, name: &[u8]) -> io::Result<()> {
 		let child_ino = self.lookup_child(parent, name)?;
 		if self.tree.node(child_ino)?.is_dir() {
@@ -1378,6 +1405,31 @@ impl Volume for MemFs {
 		})
 	}
 
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		self.with(|state| {
+			let (parent, name) = state.resolve_parent(path)?;
+			let ino = state.lookup_child(parent, &name)?;
+			let node = state.tree.node(ino)?;
+			if node.is_dir() {
+				return Err(errno(libc::EISDIR));
+			}
+			if !node.is_file() {
+				return Err(errno(libc::EPERM));
+			}
+			let cap = node.attr.size.saturating_sub(offset).min(len as u64) as usize;
+			let mut out = Vec::with_capacity(cap);
+			state.read_bytes(ino, offset, cap, |slice| {
+				out.extend_from_slice(slice);
+				Ok(())
+			})?;
+			Ok(out)
+		})
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		self.with(|state| state.walk(root))
+	}
+
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		self.with(|state| {
 			state.writable()?;
@@ -1656,6 +1708,29 @@ impl Snapshot for MemFs {
 				.ok_or_else(|| errno(libc::ENOENT))
 		})
 	}
+
+	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
+		let snapshot = self.with(|state| {
+			let tree = state
+				.store
+				.snapshots
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.get(id)
+				.cloned()
+				.ok_or_else(|| errno(libc::ENOENT))?;
+			Ok(Self {
+				state: RefCell::new(FsState {
+					read_only: true,
+					tree,
+					handles: HashMap::new(),
+					next_handle: 1,
+					store: Arc::clone(&state.store),
+				}),
+			})
+		})?;
+		diff_volumes(&snapshot, self, scope).await
+	}
 }
 
 fn validate_component(name: &[u8]) -> io::Result<()> {
@@ -1713,8 +1788,8 @@ mod tests {
 	use std::task::{Context as TaskContext, Poll, Waker};
 
 	use api::{
-		Context, CreateArgs, Extent, Fuse, Memory, MemoryRange, Snapshot, Volume, ZeroCopyReader,
-		ZeroCopyWriter,
+		Context, CreateArgs, DiffKind, Extent, Fuse, Memory, MemoryRange, Snapshot, Volume,
+		ZeroCopyReader, ZeroCopyWriter,
 	};
 
 	use super::*;
@@ -1872,6 +1947,327 @@ mod tests {
 
 		block_on(fs.delete(&snap1)).unwrap();
 		assert!(block_on(fs.branch(&snap1)).is_err());
+	}
+
+	#[test]
+	fn walk_is_relative_sorted_and_does_not_follow_symlinks() {
+		let fs = MemFs::new(false);
+		block_on(fs.create_dir_all(Path::new("/project/src"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/project/src/lib.rs"), b"lib")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/project/readme"), b"read")).unwrap();
+		block_on(Volume::symlink(
+			&fs,
+			Path::new("src"),
+			Path::new("/project/link"),
+		))
+		.unwrap();
+
+		let entries = block_on(Volume::walk(&fs, Path::new("/"))).unwrap();
+		let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+		assert_eq!(
+			paths,
+			vec![
+				PathBuf::from("project"),
+				PathBuf::from("project/link"),
+				PathBuf::from("project/readme"),
+				PathBuf::from("project/src"),
+				PathBuf::from("project/src/lib.rs"),
+			]
+		);
+		assert!(paths.iter().all(|path| !path.is_absolute()));
+		assert!(!paths.contains(&PathBuf::from("project/link/lib.rs")));
+		let link = entries
+			.iter()
+			.find(|entry| entry.path == Path::new("project/link"))
+			.unwrap();
+		assert_eq!(link.attr.mode & 0o170000, 0o120000);
+		let lib = entries
+			.iter()
+			.find(|entry| entry.path == Path::new("project/src/lib.rs"))
+			.unwrap();
+		assert_eq!(lib.attr.size, 3);
+
+		let scoped = block_on(Volume::walk(&fs, Path::new("project/src"))).unwrap();
+		assert_eq!(scoped.len(), 1);
+		assert_eq!(scoped[0].path, PathBuf::from("lib.rs"));
+
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/missing")))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOENT)
+		);
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/project/readme")))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOTDIR)
+		);
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/project/link")))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOTDIR)
+		);
+		assert_eq!(
+			block_on(Volume::walk(&fs, Path::new("/"))).unwrap(),
+			entries
+		);
+	}
+
+	#[test]
+	fn read_range_stops_at_bounds_and_end_of_file() {
+		let fs = MemFs::new(false);
+		block_on(fs.create_dir_all(Path::new("/dir"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/text"), b"0123456789")).unwrap();
+		block_on(Volume::symlink(&fs, Path::new("text"), Path::new("/link"))).unwrap();
+
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/text"), 0, 4)).unwrap(),
+			b"0123"
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/text"), 6, 100)).unwrap(),
+			b"6789"
+		);
+		assert!(
+			block_on(Volume::read_range(&fs, Path::new("/text"), 10, 4))
+				.unwrap()
+				.is_empty()
+		);
+		assert!(
+			block_on(Volume::read_range(&fs, Path::new("/text"), u64::MAX, 4))
+				.unwrap()
+				.is_empty()
+		);
+		assert!(
+			block_on(Volume::read_range(&fs, Path::new("/text"), 3, 0))
+				.unwrap()
+				.is_empty()
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/text"), 2, usize::MAX)).unwrap(),
+			b"23456789"
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/missing"), 0, 1))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENOENT)
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/dir"), 0, 1))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::EISDIR)
+		);
+		assert_eq!(
+			block_on(Volume::read_range(&fs, Path::new("/link"), 0, 1))
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::EPERM)
+		);
+	}
+
+	#[test]
+	fn snapshot_diff_reports_nested_changes_and_honours_scope() {
+		let fs = MemFs::new(false);
+		block_on(fs.create_dir_all(Path::new("/sub"))).unwrap();
+		for (path, data) in [
+			("/keep", b"keep".as_slice()),
+			("/edit", b"AAAA".as_slice()),
+			("/remove", b"gone".as_slice()),
+			("/kind", b"file".as_slice()),
+			("/sub/nested", b"one!".as_slice()),
+			("/sub/removed", b"old!".as_slice()),
+		] {
+			block_on(Volume::write(&fs, Path::new(path), data)).unwrap();
+		}
+		block_on(Volume::symlink(&fs, Path::new("keep"), Path::new("/link"))).unwrap();
+		let snapshot = block_on(fs.snapshot()).unwrap();
+
+		// A same-length edit whose timestamps memfs never updates.
+		block_on(Volume::write(&fs, Path::new("/edit"), b"BBBB")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/sub/nested"), b"two!")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/add"), b"new")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/sub/added"), b"new")).unwrap();
+		block_on(fs.remove_file(Path::new("/remove"))).unwrap();
+		block_on(fs.remove_file(Path::new("/sub/removed"))).unwrap();
+		block_on(fs.remove_file(Path::new("/kind"))).unwrap();
+		block_on(fs.create_dir(Path::new("/kind"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/kind/child"), b"x")).unwrap();
+		block_on(fs.remove_file(Path::new("/link"))).unwrap();
+		block_on(Volume::symlink(&fs, Path::new("add"), Path::new("/link"))).unwrap();
+
+		let diff = block_on(fs.diff(&snapshot, Path::new("/"))).unwrap();
+		let changed: Vec<(PathBuf, DiffKind)> = diff
+			.into_iter()
+			.map(|entry| (entry.path, entry.kind))
+			.collect();
+		assert_eq!(
+			changed,
+			vec![
+				(PathBuf::from("add"), DiffKind::Added),
+				(PathBuf::from("edit"), DiffKind::Modified),
+				(PathBuf::from("kind"), DiffKind::Modified),
+				(PathBuf::from("kind/child"), DiffKind::Added),
+				(PathBuf::from("link"), DiffKind::Modified),
+				(PathBuf::from("remove"), DiffKind::Removed),
+				(PathBuf::from("sub/added"), DiffKind::Added),
+				(PathBuf::from("sub/nested"), DiffKind::Modified),
+				(PathBuf::from("sub/removed"), DiffKind::Removed),
+			]
+		);
+
+		let scoped = block_on(fs.diff(&snapshot, Path::new("sub"))).unwrap();
+		assert_eq!(
+			scoped
+				.into_iter()
+				.map(|entry| (entry.path, entry.kind))
+				.collect::<Vec<_>>(),
+			vec![
+				(PathBuf::from("added"), DiffKind::Added),
+				(PathBuf::from("nested"), DiffKind::Modified),
+				(PathBuf::from("removed"), DiffKind::Removed),
+			]
+		);
+
+		// The snapshot remains unchanged.
+		let branched = block_on(fs.branch(&snapshot)).unwrap();
+		assert_eq!(
+			block_on(Volume::read(&branched, Path::new("/edit"))).unwrap(),
+			b"AAAA"
+		);
+		assert!(block_on(fs.diff(&snapshot, Path::new("/missing"))).is_err());
+		assert!(block_on(fs.diff(&999, Path::new("/"))).is_err());
+
+		block_on(fs.restore(&snapshot)).unwrap();
+		assert!(
+			block_on(fs.diff(&snapshot, Path::new("/")))
+				.unwrap()
+				.is_empty()
+		);
+	}
+
+	/// Uses the trait's default walk for generic walk/diff tests.
+	struct ListingOnly<'a>(&'a MemFs);
+
+	impl Volume for ListingOnly<'_> {
+		async fn stat(&self, path: &Path) -> io::Result<Attr> {
+			Volume::stat(self.0, path).await
+		}
+
+		async fn readlink(&self, path: &Path) -> io::Result<Vec<u8>> {
+			Volume::readlink(self.0, path).await
+		}
+
+		async fn list(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+			Volume::list(self.0, path).await
+		}
+
+		async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+			Volume::read_range(self.0, path, offset, len).await
+		}
+	}
+
+	#[test]
+	fn generic_listing_walk_and_diff_match_the_native_versions() {
+		let fs = MemFs::new(false);
+		block_on(fs.create_dir_all(Path::new("/a/b"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/a/b/file"), b"one")).unwrap();
+		block_on(Volume::symlink(&fs, Path::new("b"), Path::new("/a/link"))).unwrap();
+		let snapshot = block_on(fs.snapshot()).unwrap();
+		block_on(Volume::write(&fs, Path::new("/a/b/file"), b"two")).unwrap();
+
+		let listing = ListingOnly(&fs);
+		assert_eq!(
+			block_on(Volume::walk(&listing, Path::new("/"))).unwrap(),
+			block_on(Volume::walk(&fs, Path::new("/"))).unwrap()
+		);
+
+		let snapshot_view = block_on(fs.branch(&snapshot)).unwrap();
+		let diff = block_on(diff_volumes(
+			&ListingOnly(&snapshot_view),
+			&listing,
+			Path::new("/"),
+		))
+		.unwrap();
+		assert_eq!(diff.len(), 1);
+		assert_eq!(diff[0].path, PathBuf::from("a/b/file"));
+		assert_eq!(diff[0].kind, DiffKind::Modified);
+	}
+
+	/// Limits read lengths while preserving the reported file size.
+	struct PartialReads<'a> {
+		fs: &'a MemFs,
+		max: usize,
+	}
+
+	impl Volume for PartialReads<'_> {
+		async fn stat(&self, path: &Path) -> io::Result<Attr> {
+			Volume::stat(self.fs, path).await
+		}
+
+		async fn readlink(&self, path: &Path) -> io::Result<Vec<u8>> {
+			Volume::readlink(self.fs, path).await
+		}
+
+		async fn list(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+			Volume::list(self.fs, path).await
+		}
+
+		async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+			let mut bytes = Volume::read_range(self.fs, path, offset, len).await?;
+			bytes.truncate(self.max);
+			Ok(bytes)
+		}
+	}
+
+	#[test]
+	fn diff_loops_over_partial_reads_and_rejects_premature_eof() {
+		let fs = MemFs::new(false);
+		block_on(Volume::write(&fs, Path::new("/file"), b"AAAA")).unwrap();
+		let snapshot = block_on(fs.snapshot()).unwrap();
+		let snapshot_view = block_on(fs.branch(&snapshot)).unwrap();
+
+		let unchanged = block_on(diff_volumes(
+			&PartialReads {
+				fs: &snapshot_view,
+				max: 1,
+			},
+			&PartialReads {
+				fs: &snapshot_view,
+				max: 1,
+			},
+			Path::new("/"),
+		))
+		.unwrap();
+		assert!(unchanged.is_empty());
+
+		block_on(Volume::write(&fs, Path::new("/file"), b"BBBB")).unwrap();
+		let changed = block_on(diff_volumes(
+			&PartialReads {
+				fs: &snapshot_view,
+				max: 1,
+			},
+			&PartialReads { fs: &fs, max: 1 },
+			Path::new("/"),
+		))
+		.unwrap();
+		assert_eq!(changed.len(), 1);
+		assert_eq!(changed[0].path, PathBuf::from("file"));
+		assert_eq!(changed[0].kind, DiffKind::Modified);
+
+		let error = block_on(diff_volumes(
+			&PartialReads {
+				fs: &snapshot_view,
+				max: 0,
+			},
+			&PartialReads { fs: &fs, max: 0 },
+			Path::new("/"),
+		))
+		.unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 	}
 
 	#[test]
