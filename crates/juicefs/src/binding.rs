@@ -549,6 +549,19 @@ unsafe extern "C" {
 	pub fn juicefs_dirents_free(list: usize);
 }
 unsafe extern "C" {
+	pub fn juicefs_format(
+		payload: *mut ::std::os::raw::c_char,
+		name: *mut ::std::os::raw::c_char,
+		storage: *mut ::std::os::raw::c_char,
+		bucket: *mut ::std::os::raw::c_char,
+		accessKey: *mut ::std::os::raw::c_char,
+		secretKey: *mut ::std::os::raw::c_char,
+		sessionToken: *mut ::std::os::raw::c_char,
+		force: ::std::os::raw::c_int,
+		err: *mut usize,
+	) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
 	pub fn juicefs_update_readdir_offset(
 		h: usize,
 		ctx: *mut juicefs_ctx,

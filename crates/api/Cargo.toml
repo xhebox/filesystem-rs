@@ -11,6 +11,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+asyncband = { workspace = true, features = ["mutex"] }
 libc = { workspace = true }
 
 [lints]

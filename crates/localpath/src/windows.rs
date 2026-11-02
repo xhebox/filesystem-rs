@@ -35,6 +35,7 @@ use api::{
 	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
 	diff_volumes,
 };
+use api::{IndexOptions, Search, SearchIndex};
 
 const NO_CACHE: Timeout = (0, 0);
 type Timeout = (u64, u32);
@@ -166,13 +167,31 @@ pub(crate) struct FsState {
 /// A confined host directory tree rooted at a file descriptor opened before
 /// any sandbox transition.
 pub struct PassthroughFs {
+	index: Option<Arc<SearchIndex>>,
 	pub(crate) state: RefCell<FsState>,
 }
 
 impl PassthroughFs {
+	pub fn with_hook(mut self, hook: Arc<dyn api::VolumeHook>) -> Self {
+		if self.index.is_none() {
+			self.enable_index(IndexOptions::default());
+		}
+		self.index.as_ref().unwrap().register_hook(hook);
+		self
+	}
+
+	pub fn with_index(mut self, options: IndexOptions) -> Self {
+		self.enable_index(options);
+		self
+	}
+	pub fn enable_index(&mut self, options: IndexOptions) {
+		self.index = Some(Arc::new(SearchIndex::new(options)));
+	}
+
 	pub fn new(root: File, read_only: bool) -> io::Result<Self> {
 		let state = FsState::new(root, None, read_only)?;
 		Ok(Self {
+			index: None,
 			state: RefCell::new(state),
 		})
 	}
@@ -181,6 +200,7 @@ impl PassthroughFs {
 		let pool = Arc::new(SnapshotPool::new(snapshots)?);
 		let state = FsState::new(root, Some(pool), read_only)?;
 		Ok(Self {
+			index: None,
 			state: RefCell::new(state),
 		})
 	}
@@ -736,6 +756,7 @@ impl FsState {
 		let work_root = inspect_path(&work_path)?;
 		let state = FsState::new(work_root, Some(pool), false)?;
 		Ok(PassthroughFs {
+			index: None,
 			state: RefCell::new(state),
 		})
 	}
@@ -1193,11 +1214,20 @@ impl Snapshot for PassthroughFs {
 	}
 
 	async fn branch(&self, id: &u64) -> io::Result<Self> {
-		self.with(|state| state.branch(*id))
+		let mut branch = self.with(|state| state.branch(*id))?;
+		branch.index = self
+			.index
+			.as_ref()
+			.map(|i| Arc::new(SearchIndex::new(*i.options())));
+		Ok(branch)
 	}
 
 	async fn restore(&self, id: &u64) -> io::Result<()> {
-		self.with(|state| state.restore(*id))
+		async { self.with(|state| state.restore(*id)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_reset();
+		}
+		Ok(())
 	}
 
 	async fn delete(&self, id: &u64) -> io::Result<()> {
@@ -1215,6 +1245,22 @@ impl Snapshot for PassthroughFs {
 }
 
 impl Volume for PassthroughFs {
+	async fn getxattr(&self, _path: &Path, _name: &CStr) -> io::Result<Vec<u8>> {
+		Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+	}
+	async fn setxattr(
+		&self,
+		_path: &Path,
+		_name: &CStr,
+		_value: &[u8],
+		_flags: u32,
+	) -> io::Result<()> {
+		Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+	}
+	async fn removexattr(&self, _path: &Path, _name: &CStr) -> io::Result<()> {
+		Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+	}
+
 	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
 		let (file, len) = self.with(|state| state.open_volume_read(path))?;
 		if len == 0 {
@@ -1241,15 +1287,26 @@ impl Volume for PassthroughFs {
 	}
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-		let file = self.with(|state| state.open_volume_write(path))?;
-		if data.is_empty() {
-			return Ok(());
+		async {
+			let file = self.with(|state| state.open_volume_write(path))?;
+			if data.is_empty() {
+				return Ok::<(), io::Error>(());
+			}
+			let buffer = completion::Buffer::from(data.to_vec());
+			file.write_all_at(buffer, 0)
+				.await
+				.map(|_| ())
+				.map_err(engine_io)
 		}
-		let buffer = completion::Buffer::from(data.to_vec());
-		file.write_all_at(buffer, 0)
-			.await
-			.map(|_| ())
-			.map_err(engine_io)
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = Volume::stat(self, path).await?;
+			for (name, raw) in idx.notify_write(path, &attr, data) {
+				let _result = Volume::setxattr(self, path, name, &raw, 0).await;
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn stat(&self, path: &Path) -> io::Result<Attr> {
@@ -1311,74 +1368,142 @@ impl Volume for PassthroughFs {
 	}
 
 	async fn create_dir(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let resolved = state.resolve_volume_path(path)?;
-			fs::create_dir(resolved)
-		})
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let resolved = state.resolve_volume_path(path)?;
+				fs::create_dir(resolved)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = Volume::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
+				}
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let mut current = state.node(ROOT_ID)?.path.clone();
-			for part in split_path(path)? {
-				current.push(part);
-				if !current.exists() {
-					fs::create_dir(&current)?;
-				} else if !fs::symlink_metadata(&current)?.is_dir() {
-					return Err(errno(libc::ENOTDIR));
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let mut current = state.node(ROOT_ID)?.path.clone();
+				for part in split_path(path)? {
+					current.push(part);
+					if !current.exists() {
+						fs::create_dir(&current)?;
+					} else if !fs::symlink_metadata(&current)?.is_dir() {
+						return Err(errno(libc::ENOTDIR));
+					}
+				}
+				Ok(())
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = Volume::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
 				}
 			}
-			Ok(())
-		})
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_file(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let resolved = state.resolve_volume_path(path)?;
-			fs::remove_file(resolved)
-		})
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let resolved = state.resolve_volume_path(path)?;
+				fs::remove_file(resolved)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let resolved = state.resolve_volume_path(path)?;
-			fs::remove_dir(resolved)
-		})
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let resolved = state.resolve_volume_path(path)?;
+				fs::remove_dir(resolved)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_all(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let parts = split_path(path)?;
-			if parts.is_empty() {
-				let root_path = state.node(ROOT_ID)?.path.clone();
-				return clear_dir_contents(&root_path);
-			}
-			let resolved = state.resolve_volume_path(path)?;
-			remove_path_tree(&resolved)
-		})
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let parts = split_path(path)?;
+				if parts.is_empty() {
+					let root_path = state.node(ROOT_ID)?.path.clone();
+					return clear_dir_contents(&root_path);
+				}
+				let resolved = state.resolve_volume_path(path)?;
+				remove_path_tree(&resolved)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let src = state.resolve_volume_path(from)?;
-			let dst = state.resolve_volume_path(to)?;
-			fs::rename(src, dst)
-		})
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let src = state.resolve_volume_path(from)?;
+				let dst = state.resolve_volume_path(to)?;
+				fs::rename(src, dst)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_rename(from, to);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-		self.with(|state| {
-			state.writable()?;
-			let src = state.resolve_volume_path(from)?;
-			let dst = state.resolve_volume_path(to)?;
-			fs::copy(src, dst)
-		})
+		let result = async {
+			self.with(|state| {
+				state.writable()?;
+				let src = state.resolve_volume_path(from)?;
+				let dst = state.resolve_volume_path(to)?;
+				fs::copy(src, dst)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = Volume::stat(self, to).await?;
+			let data = Volume::read(self, to).await?;
+			for (name, raw) in idx.notify_write(to, &attr, &data) {
+				let _result = Volume::setxattr(self, to, name, &raw, 0).await;
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(result)
 	}
 }
 
@@ -1563,5 +1688,11 @@ mod tests {
 		for name in [b"".as_slice(), b".", b"..", b"x/y", b"x\\y", b"C:", b"x\0"] {
 			assert!(validate_component(name).is_err());
 		}
+	}
+}
+
+impl Search for PassthroughFs {
+	fn search_index(&self) -> Option<&SearchIndex> {
+		self.index.as_deref()
 	}
 }

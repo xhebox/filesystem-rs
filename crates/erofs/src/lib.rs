@@ -15,6 +15,7 @@ use api::{
 	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
 	ListxattrReply, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter, name_to_path,
 };
+use api::{IndexOptions, Search, SearchIndex};
 pub use fs_core::BlockRead;
 use fs_core::FileDevice;
 use fs_erofs::dir::ftype;
@@ -103,12 +104,21 @@ impl BlockRead for BytesDevice {
 
 /// A mounted read-only EROFS image serving [`api::Fuse`] and [`api::Volume`].
 pub struct Erofs {
+	index: Option<Arc<SearchIndex>>,
 	inner: Filesystem,
 	root_nid: u64,
 	handles: Mutex<HandleTable>,
 }
 
 impl Erofs {
+	pub fn with_index(mut self, options: IndexOptions) -> Self {
+		self.enable_index(options);
+		self
+	}
+	pub fn enable_index(&mut self, options: IndexOptions) {
+		self.index = Some(Arc::new(SearchIndex::new(options)));
+	}
+
 	/// Opens an EROFS image from `device` with the default metadata block cache.
 	pub fn open(device: Arc<dyn BlockRead>) -> io::Result<Self> {
 		let inner =
@@ -117,6 +127,7 @@ impl Erofs {
 		Ok(Self {
 			inner,
 			root_nid,
+			index: None,
 			handles: Mutex::new(HandleTable::new()),
 		})
 	}
@@ -707,6 +718,20 @@ impl Fuse for Erofs {
 }
 
 impl Volume for Erofs {
+	async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+		let node = self.resolve_path(path)?;
+		if !name.to_bytes().starts_with(b"user.") || node.is_symlink() {
+			return Err(errno(libc::ENODATA));
+		}
+		self.inner
+			.xattrs(&node)
+			.map_err(erofs_io)?
+			.into_iter()
+			.find(|(key, _)| key.as_slice() == name.to_bytes())
+			.map(|(_, value)| value)
+			.ok_or_else(|| errno(libc::ENODATA))
+	}
+
 	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
 		let node = self.resolve_path(path)?;
 		if node.is_dir() {
@@ -844,6 +869,12 @@ fn errno_from_block(error: &fs_core::Error) -> io::Error {
 
 fn errno(code: libc::c_int) -> io::Error {
 	io::Error::from_raw_os_error(code)
+}
+
+impl Search for Erofs {
+	fn search_index(&self) -> Option<&SearchIndex> {
+		self.index.as_deref()
+	}
 }
 
 #[cfg(test)]
@@ -1117,7 +1148,7 @@ mod tests {
 		let entry = block_on(fs.lookup(&ctx, ROOT_ID, c"hello.txt")).unwrap();
 		assert_eq!(entry.attr.size, 11);
 
-		match block_on(fs.getxattr(&ctx, entry.inode, c"user.tag", 16)).unwrap() {
+		match block_on(Fuse::getxattr(&fs, &ctx, entry.inode, c"user.tag", 16)).unwrap() {
 			GetxattrReply::Value(v) => assert_eq!(v, b"v1"),
 			GetxattrReply::Size(_) => panic!("expected value"),
 		}

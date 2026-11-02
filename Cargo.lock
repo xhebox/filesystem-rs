@@ -88,6 +88,7 @@ dependencies = [
 name = "boxfs-api"
 version = "0.1.7"
 dependencies = [
+ "asyncband",
  "libc",
 ]
 

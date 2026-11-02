@@ -1003,3 +1003,267 @@ fn volume_path_operations_and_confinement() {
 			.is_empty()
 	);
 }
+
+#[test]
+fn path_xattrs_search_and_external_changes() {
+	use api::{IndexOptions, Search, SearchQuery, XATTR_SIG_NAME, decode_sig_xattr};
+	let (_scratch, host, root) = root();
+	let fs = filesystem(root, false).with_index(IndexOptions::default());
+	run(async {
+		let path = Path::new("/text");
+		let mut data = b"padding\n".repeat(3000);
+		data.extend_from_slice(b"a Needle end\n");
+		Volume::write(&fs, path, &data).await.unwrap();
+		Volume::setxattr(&fs, path, c"user.test", b"value", 0)
+			.await
+			.unwrap();
+		assert_eq!(
+			Volume::getxattr(&fs, path, c"user.test").await.unwrap(),
+			b"value"
+		);
+		Volume::removexattr(&fs, path, c"user.test").await.unwrap();
+		assert!(Volume::getxattr(&fs, path, c"user.test").await.is_err());
+		let attr = Volume::stat(&fs, path).await.unwrap();
+		let raw = Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap();
+		assert!(decode_sig_xattr(&attr, &raw).is_some());
+		fs.search_index().unwrap().clear();
+		let matches = fs
+			.search(Path::new("/"), &SearchQuery::new("Needle"))
+			.await
+			.unwrap();
+		assert_eq!(matches.len(), 1);
+		assert_eq!((matches[0].line, matches[0].column), (3001, 3));
+		assert_eq!(matches[0].line_text, "a Needle end");
+		fs::write(host.join("text"), b"new external text\n").unwrap();
+		assert!(decode_sig_xattr(&Volume::stat(&fs, path).await.unwrap(), &raw).is_none());
+		fs.search_index().unwrap().notify_reset();
+		let found = fs
+			.search(Path::new("/"), &SearchQuery::new("external"))
+			.await
+			.unwrap();
+		assert_eq!(found.len(), 1);
+		assert_eq!((found[0].line, found[0].column), (1, 5));
+	});
+}
+
+#[test]
+fn indexed_search_snapshot_restores_xattrs() {
+	use api::{IndexOptions, Search, SearchQuery, XATTR_SIG_NAME};
+	let scratch = Scratch::new();
+	let host = scratch.path().join("root");
+	let pool = scratch.path().join("snapshots");
+	fs::create_dir(&host).unwrap();
+	fs::create_dir(&pool).unwrap();
+	let fs = PassthroughFs::with_snapshots(
+		File::open(&host).unwrap(),
+		File::open(&pool).unwrap(),
+		false,
+	)
+	.unwrap()
+	.with_index(IndexOptions::default());
+	run(async {
+		let path = Path::new("/text");
+		Volume::write(&fs, path, b"old snapshot text\n")
+			.await
+			.unwrap();
+		let raw = Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap();
+		let id = fs.snapshot().await.unwrap();
+		Volume::write(&fs, path, b"new text\n").await.unwrap();
+		fs.restore(&id).await.unwrap();
+		assert_eq!(
+			Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap(),
+			raw
+		);
+		let found = fs
+			.search(Path::new("/"), &SearchQuery::new("snapshot"))
+			.await
+			.unwrap();
+		assert_eq!(found.len(), 1);
+		assert_eq!((found[0].line, found[0].column), (1, 5));
+	});
+}
+
+struct SearchReads<'a> {
+	fs: &'a PassthroughFs,
+	ranges: std::cell::RefCell<Vec<u64>>,
+}
+
+impl Volume for SearchReads<'_> {
+	async fn walk(&self, path: &Path) -> io::Result<Vec<api::WalkEntry>> {
+		self.fs.walk(path).await
+	}
+	async fn getxattr(&self, path: &Path, name: &std::ffi::CStr) -> io::Result<Vec<u8>> {
+		Volume::getxattr(self.fs, path, name).await
+	}
+	async fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+		panic!("indexed search must not read the whole file")
+	}
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		self.ranges.borrow_mut().push(offset);
+		self.fs.read_range(path, offset, len.min(97)).await
+	}
+}
+
+impl api::Search for SearchReads<'_> {
+	fn search_index(&self) -> Option<&api::SearchIndex> {
+		api::Search::search_index(self.fs)
+	}
+}
+
+#[test]
+fn indexed_read_ranges_skip_nonmatching_pages() {
+	use api::{IndexOptions, Search, SearchQuery};
+	let (_scratch, _host, root) = root();
+	let fs = filesystem(root, false).with_index(IndexOptions::default());
+	run(async {
+		let mut data = b"padding\n".repeat(4096);
+		data.extend_from_slice(b"unique Needle end\n");
+		Volume::write(&fs, Path::new("/text"), &data).await.unwrap();
+		fs.search_index().unwrap().clear();
+		let counted = SearchReads {
+			fs: &fs,
+			ranges: std::cell::RefCell::new(Vec::new()),
+		};
+		let found = counted
+			.search(Path::new("/"), &SearchQuery::new("Needle"))
+			.await
+			.unwrap();
+		assert_eq!(found.len(), 1);
+		assert_eq!((found[0].line, found[0].column), (4097, 8));
+		assert!(
+			counted
+				.ranges
+				.borrow()
+				.iter()
+				.all(|&offset| offset >= 6 * 4096)
+		);
+		counted.ranges.borrow_mut().clear();
+		assert!(
+			counted
+				.search(Path::new("/"), &SearchQuery::new("ZZnotpresentZZ"))
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		assert!(counted.ranges.borrow().is_empty());
+	});
+}
+
+#[test]
+fn path_xattrs_respect_namespace_root_and_symlinks() {
+	let (_scratch, host, root) = root();
+	let fs = filesystem(root, false);
+	fs::write(host.join("target"), b"data").unwrap();
+	symlink("target", host.join("link")).unwrap();
+	run(async {
+		Volume::setxattr(&fs, Path::new("/"), c"user.root", b"value", 0)
+			.await
+			.unwrap();
+		assert_eq!(
+			Volume::getxattr(&fs, Path::new("/"), c"user.root")
+				.await
+				.unwrap(),
+			b"value"
+		);
+		assert_eq!(
+			Volume::getxattr(&fs, Path::new("/link"), c"user.root")
+				.await
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENODATA)
+		);
+		assert_eq!(
+			Volume::setxattr(&fs, Path::new("/link"), c"user.root", b"value", 0)
+				.await
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::EPERM)
+		);
+		assert_eq!(
+			Volume::getxattr(&fs, Path::new("/target"), c"security.hidden")
+				.await
+				.unwrap_err()
+				.raw_os_error(),
+			Some(libc::ENODATA)
+		);
+	});
+}
+
+struct RestartReads<'a> {
+	fs: &'a PassthroughFs,
+	walks: std::cell::Cell<usize>,
+	reads: std::cell::RefCell<Vec<PathBuf>>,
+	xattrs: std::cell::RefCell<Vec<PathBuf>>,
+}
+impl Volume for RestartReads<'_> {
+	async fn walk(&self, path: &Path) -> io::Result<Vec<api::WalkEntry>> {
+		self.walks.set(self.walks.get() + 1);
+		self.fs.walk(path).await
+	}
+	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+		self.reads.borrow_mut().push(path.to_owned());
+		Volume::read(self.fs, path).await
+	}
+	async fn getxattr(&self, path: &Path, name: &std::ffi::CStr) -> io::Result<Vec<u8>> {
+		self.xattrs.borrow_mut().push(path.to_owned());
+		Volume::getxattr(self.fs, path, name).await
+	}
+	async fn setxattr(
+		&self,
+		path: &Path,
+		name: &std::ffi::CStr,
+		value: &[u8],
+		flags: u32,
+	) -> io::Result<()> {
+		Volume::setxattr(self.fs, path, name, value, flags).await
+	}
+}
+impl api::Search for RestartReads<'_> {
+	fn search_index(&self) -> Option<&api::SearchIndex> {
+		api::Search::search_index(self.fs)
+	}
+}
+
+#[test]
+fn search_root_snapshots_survive_restart_and_reconcile_only_offline_changes() {
+	use api::{IndexOptions, Search};
+	let (_scratch, host, root) = root();
+	let fs = filesystem(root, false).with_index(IndexOptions::default());
+	run(async {
+		Volume::write(&fs, Path::new("/same"), b"same\n")
+			.await
+			.unwrap();
+		Volume::write(&fs, Path::new("/changed"), b"old\n")
+			.await
+			.unwrap();
+		fs.indexed_walk(Path::new("/")).await.unwrap();
+	});
+	drop(fs);
+	let fs = filesystem(File::open(&host).unwrap(), false).with_index(IndexOptions::default());
+	let counted = RestartReads {
+		fs: &fs,
+		walks: std::cell::Cell::new(0),
+		reads: Default::default(),
+		xattrs: Default::default(),
+	};
+	run(async {
+		assert_eq!(counted.indexed_walk(Path::new("/")).await.unwrap().len(), 2);
+		assert!(counted.reads.borrow().is_empty());
+		assert!(counted.xattrs.borrow().iter().all(|p| p == Path::new("/")));
+		counted.indexed_walk(Path::new("/")).await.unwrap();
+		assert_eq!(counted.walks.get(), 1);
+	});
+	drop(fs);
+	fs::write(host.join("changed"), b"new\n").unwrap();
+	let fs = filesystem(File::open(&host).unwrap(), false).with_index(IndexOptions::default());
+	let counted = RestartReads {
+		fs: &fs,
+		walks: std::cell::Cell::new(0),
+		reads: Default::default(),
+		xattrs: Default::default(),
+	};
+	run(async {
+		counted.indexed_walk(Path::new("/")).await.unwrap();
+		assert_eq!(*counted.reads.borrow(), [PathBuf::from("/changed")]);
+	});
+}

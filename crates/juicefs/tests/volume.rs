@@ -148,3 +148,81 @@ fn walk_read_range_and_diff() {
 	run(Snapshot::delete(&volume, &snapshot));
 	run(Volume::remove_all(&volume, root));
 }
+
+#[test]
+fn format_and_mount_isolated_sqlite_volumes() {
+	let dir =
+		std::env::temp_dir().join(format!("boxfs-juicefs-format-test-{}", std::process::id()));
+	drop(fs::remove_dir_all(&dir));
+	let owner_a = dir.join("owner-a");
+	let owner_b = dir.join("owner-b");
+	fs::create_dir_all(owner_a.join("chunks")).unwrap();
+	fs::create_dir_all(owner_b.join("chunks")).unwrap();
+
+	let meta_a = format!("sqlite3://{}", owner_a.join("meta.db").display());
+	let meta_b = format!("sqlite3://{}", owner_b.join("meta.db").display());
+
+	boxfs_juicefs::Volume::format(
+		&meta_a,
+		&boxfs_juicefs::Format {
+			name: "owner-a".into(),
+			storage: "file".into(),
+			bucket: owner_a.join("chunks").display().to_string(),
+			..Default::default()
+		},
+	)
+	.unwrap();
+	// Idempotent second call when force == false.
+	boxfs_juicefs::Volume::format(
+		&meta_a,
+		&boxfs_juicefs::Format {
+			name: "owner-a".into(),
+			storage: "file".into(),
+			bucket: owner_a.join("chunks").display().to_string(),
+			..Default::default()
+		},
+	)
+	.unwrap();
+
+	boxfs_juicefs::Volume::format(
+		&meta_b,
+		&boxfs_juicefs::Format {
+			name: "owner-b".into(),
+			storage: "file".into(),
+			bucket: owner_b.join("chunks").display().to_string(),
+			..Default::default()
+		},
+	)
+	.unwrap();
+
+	{
+		let vol_a = boxfs_juicefs::Volume::mount(&meta_a, &owner_a.join("cache")).unwrap();
+		let vol_b = boxfs_juicefs::Volume::mount(&meta_b, &owner_b.join("cache")).unwrap();
+		run(Volume::write(
+			&vol_a,
+			Path::new("/secret.txt"),
+			b"alice-only",
+		));
+		assert!(try_run(Volume::read(&vol_b, Path::new("/secret.txt"))).is_err());
+		run(Volume::write(&vol_b, Path::new("/secret.txt"), b"bob-only"));
+		assert_eq!(
+			run(Volume::read(&vol_a, Path::new("/secret.txt"))),
+			b"alice-only"
+		);
+		assert_eq!(
+			run(Volume::read(&vol_b, Path::new("/secret.txt"))),
+			b"bob-only"
+		);
+	}
+
+	// Re-mount vol_a after drop to verify native persistence.
+	{
+		let vol_a = boxfs_juicefs::Volume::mount(&meta_a, &owner_a.join("cache")).unwrap();
+		assert_eq!(
+			run(Volume::read(&vol_a, Path::new("/secret.txt"))),
+			b"alice-only"
+		);
+	}
+
+	drop(fs::remove_dir_all(&dir));
+}
