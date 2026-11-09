@@ -1679,6 +1679,12 @@ fn errno(code: libc::c_int) -> io::Error {
 	io::Error::from_raw_os_error(code)
 }
 
+impl Search for PassthroughFs {
+	fn search_index(&self) -> Option<&SearchIndex> {
+		self.index.as_deref()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1688,11 +1694,5 @@ mod tests {
 		for name in [b"".as_slice(), b".", b"..", b"x/y", b"x\\y", b"C:", b"x\0"] {
 			assert!(validate_component(name).is_err());
 		}
-	}
-}
-
-impl Search for PassthroughFs {
-	fn search_index(&self) -> Option<&SearchIndex> {
-		self.index.as_deref()
 	}
 }
