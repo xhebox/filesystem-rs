@@ -81,6 +81,29 @@ type session struct {
 	v *vfs.VFS
 }
 
+// juicefs_format formats or initializes one volume at `payload`. Returns 0 on
+// success; on failure returns a non-zero errno and writes the error message
+// handle into `err`.
+//
+//export juicefs_format
+func juicefs_format(payload, name, storage, bucket, accessKey, secretKey, sessionToken *C.char, force C.int, err *C.uintptr_t) C.int {
+	fmtErr := formatVolume(
+		C.GoString(payload),
+		C.GoString(name),
+		C.GoString(storage),
+		C.GoString(bucket),
+		C.GoString(accessKey),
+		C.GoString(secretKey),
+		C.GoString(sessionToken),
+		force != 0,
+	)
+	if fmtErr != nil {
+		*err = newBytes([]byte(fmtErr.Error()))
+		return C.int(syscall.EIO)
+	}
+	return 0
+}
+
 // juicefs_mount mounts one volume and returns its handle. A handle of 0 means
 // failure, and `err` is then a bytes handle holding the message, which the
 // caller reads with the `juicefs_bytes_*` functions and releases.
@@ -101,6 +124,11 @@ func juicefs_mount(payload, cacheDir *C.char, err *C.uintptr_t) C.uintptr_t {
 func juicefs_unmount(h C.uintptr_t) {
 	if h == 0 {
 		return
+	}
+	if s := lookup(h); s != nil && s.v != nil {
+		_ = s.v.FlushAll("")
+		_ = s.v.Meta.CloseSession()
+		_ = s.v.Meta.Shutdown()
 	}
 	cgo.Handle(h).Delete()
 }
@@ -436,7 +464,8 @@ func juicefs_setxattr(h C.uintptr_t, ctx *C.juicefs_ctx, ino C.uint64_t, name *C
 	return guard(h, func(s *session) C.int {
 		var data []byte
 		if length > 0 {
-			data = unsafe.Slice((*byte)(value), int(length))
+			data = make([]byte, int(length))
+			copy(data, unsafe.Slice((*byte)(value), int(length)))
 		}
 		return C.int(s.v.SetXattr(s.context(ctx), meta.Ino(ino), C.GoString(name), data, uint32(flags)))
 	})

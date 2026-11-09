@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
@@ -25,8 +26,69 @@ import (
 
 // main is never called: this package is built as an archive and linked into
 // another program, which starts the Go runtime itself (see `embed.go`). The
-// linker still wants a `main` in a `main` package.
+// linker still wants a `main` in a `main package.
 func main() {}
+
+// formatVolume initializes or updates the volume metadata at `payload` using
+// `metaCli.Init`. When `force` is false and the volume is already formatted, it
+// returns nil without overwriting the existing format.
+func formatVolume(payload, name, storage, bucket, accessKey, secretKey, sessionToken string, force bool) error {
+	metaConf := meta.DefaultConf()
+	metaConf.NoBGJob = true
+	metaConf.MountPoint = "/jfs"
+
+	metaCli := meta.NewClient(payload, metaConf)
+	defer func() { _ = metaCli.Shutdown() }()
+
+	existing, err := metaCli.Load(false)
+	if err == nil && !force {
+		return nil
+	}
+	if err != nil && !strings.HasPrefix(err.Error(), "database is not formatted") && !force {
+		return fmt.Errorf("load metadata: %w", err)
+	}
+	if storage == "" {
+		storage = "file"
+	}
+	if storage == "file" || storage == "sqlite3" {
+		abs, absErr := filepath.Abs(bucket)
+		if absErr != nil {
+			return fmt.Errorf("resolve bucket path %q: %w", bucket, absErr)
+		}
+		bucket = abs
+		if storage == "file" && !strings.HasSuffix(bucket, "/") {
+			bucket += "/"
+		}
+	}
+	volUUID := uuid.New().String()
+	if existing != nil && existing.UUID != "" {
+		volUUID = existing.UUID
+	}
+	format := &meta.Format{
+		Name:             name,
+		UUID:             volUUID,
+		Storage:          storage,
+		Tiers:            object.NewTiers(""),
+		Bucket:           bucket,
+		AccessKey:        accessKey,
+		SecretKey:        secretKey,
+		SessionToken:     sessionToken,
+		BlockSize:        4096,
+		Compression:      "none",
+		EncryptAlgo:      "aes256gcm-rsa",
+		TrashDays:        0,
+		DirStats:         true,
+		MetaVersion:      meta.MaxVersion,
+		MinClientVersion: "1.1.0-A",
+	}
+	if err := format.Encrypt(); err != nil {
+		return fmt.Errorf("encrypt format: %w", err)
+	}
+	if err := metaCli.Init(format, force); err != nil {
+		return fmt.Errorf("init format: %w", err)
+	}
+	return nil
+}
 
 // buildVFS replicates the essential stage-3 mount flow of upstream
 // cmd/mount.go: meta client, object storage, cached chunk store, VFS.

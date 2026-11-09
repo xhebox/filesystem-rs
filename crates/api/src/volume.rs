@@ -1,5 +1,6 @@
 //! Path-addressed [`Volume`] operations for callers outside a guest.
 
+use std::ffi::CStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,27 @@ pub struct WalkEntry {
 /// Unsupported operations return `ENOSYS`; `walk` defaults to `list` + `stat`.
 #[allow(async_fn_in_trait)]
 pub trait Volume {
+	/// Reads an extended attribute without following the final symlink.
+	async fn getxattr(&self, _path: &Path, _name: &CStr) -> io::Result<Vec<u8>> {
+		Err(unsupported())
+	}
+
+	/// Sets an extended attribute without following the final symlink.
+	async fn setxattr(
+		&self,
+		_path: &Path,
+		_name: &CStr,
+		_value: &[u8],
+		_flags: u32,
+	) -> io::Result<()> {
+		Err(unsupported())
+	}
+
+	/// Removes an extended attribute without following the final symlink.
+	async fn removexattr(&self, _path: &Path, _name: &CStr) -> io::Result<()> {
+		Err(unsupported())
+	}
+
 	/// Reads the entire contents of `path`.
 	async fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
 		Err(unsupported())

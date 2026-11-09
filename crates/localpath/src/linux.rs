@@ -54,6 +54,7 @@ use api::{
 	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
 	diff_volumes,
 };
+use api::{IndexOptions, Search, SearchIndex};
 
 /// Zero attribute/data timeouts: nothing the guest caches may outlive the
 /// request that produced it.
@@ -163,13 +164,31 @@ pub(crate) struct FsState {
 /// A confined host directory tree rooted at a file descriptor opened before
 /// any jail transition.
 pub struct PassthroughFs {
+	index: Option<Arc<SearchIndex>>,
 	pub(crate) state: RefCell<FsState>,
 }
 
 impl PassthroughFs {
+	pub fn with_hook(mut self, hook: Arc<dyn api::VolumeHook>) -> Self {
+		if self.index.is_none() {
+			self.enable_index(IndexOptions::default());
+		}
+		self.index.as_ref().unwrap().register_hook(hook);
+		self
+	}
+
+	pub fn with_index(mut self, options: IndexOptions) -> Self {
+		self.enable_index(options);
+		self
+	}
+	pub fn enable_index(&mut self, options: IndexOptions) {
+		self.index = Some(Arc::new(SearchIndex::new(options)));
+	}
+
 	pub fn new(root: File, read_only: bool) -> io::Result<Self> {
 		let state = FsState::new(root, None, read_only)?;
 		Ok(Self {
+			index: None,
 			state: RefCell::new(state),
 		})
 	}
@@ -180,6 +199,7 @@ impl PassthroughFs {
 		let pool = Arc::new(SnapshotPool::new(snapshots)?);
 		let state = FsState::new(root, Some(pool), read_only)?;
 		Ok(Self {
+			index: None,
 			state: RefCell::new(state),
 		})
 	}
@@ -958,6 +978,7 @@ impl FsState {
 		let work_root = open_dir_fd(pool.dir.as_raw_fd(), &work_name)?;
 		let state = FsState::new(work_root, Some(pool), false)?;
 		Ok(PassthroughFs {
+			index: None,
 			state: RefCell::new(state),
 		})
 	}
@@ -1088,6 +1109,26 @@ impl FsState {
 		}
 		out.sort_by(|a, b| a.path.cmp(&b.path));
 		Ok(out)
+	}
+
+	fn volume_xattr_file(&self, path: &Path, symlink_error: i32) -> io::Result<File> {
+		if split_path(path)?.is_empty() {
+			return open_dir_fd(self.node(ROOT_ID)?.file.as_raw_fd(), c".");
+		}
+		let (parent, name) = self.resolve_parent(path)?;
+		if inspect_name(parent.as_raw_fd(), &name)?
+			.metadata()?
+			.file_type()
+			.is_symlink()
+		{
+			return Err(io::Error::from_raw_os_error(symlink_error));
+		}
+		open_cstr(
+			parent.as_raw_fd(),
+			&name,
+			libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			0,
+		)
 	}
 
 	fn volume_stat(&self, path: &Path) -> io::Result<Attr> {
@@ -1589,11 +1630,20 @@ impl Snapshot for PassthroughFs {
 	}
 
 	async fn branch(&self, id: &u64) -> io::Result<Self> {
-		self.with(|state| state.branch(*id))
+		let mut branch = self.with(|state| state.branch(*id))?;
+		branch.index = self
+			.index
+			.as_ref()
+			.map(|i| Arc::new(SearchIndex::new(*i.options())));
+		Ok(branch)
 	}
 
 	async fn restore(&self, id: &u64) -> io::Result<()> {
-		self.with(|state| state.restore(*id))
+		async { self.with(|state| state.restore(*id)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_reset();
+		}
+		Ok(())
 	}
 
 	async fn delete(&self, id: &u64) -> io::Result<()> {
@@ -1611,6 +1661,32 @@ impl Snapshot for PassthroughFs {
 }
 
 impl Volume for PassthroughFs {
+	async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+		if !name.to_bytes().starts_with(b"user.") {
+			return Err(io::Error::from_raw_os_error(libc::ENODATA));
+		}
+		self.with(|state| get_xattr(&state.volume_xattr_file(path, libc::ENODATA)?, Some(name)))
+	}
+	async fn setxattr(&self, path: &Path, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+		ensure_user_xattr(name)?;
+		self.with(|state| {
+			state.writable()?;
+			set_xattr(
+				&state.volume_xattr_file(path, libc::EPERM)?,
+				name,
+				value,
+				flags,
+			)
+		})
+	}
+	async fn removexattr(&self, path: &Path, name: &CStr) -> io::Result<()> {
+		ensure_user_xattr(name)?;
+		self.with(|state| {
+			state.writable()?;
+			remove_xattr(&state.volume_xattr_file(path, libc::EPERM)?, name)
+		})
+	}
+
 	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
 		let (file, len) = self.with(|state| state.open_volume_read(path))?;
 		if len == 0 {
@@ -1637,15 +1713,24 @@ impl Volume for PassthroughFs {
 	}
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-		let file = self.with(|state| state.open_volume_write(path))?;
-		if data.is_empty() {
-			return Ok(());
+		async {
+			let file = self.with(|state| state.open_volume_write(path))?;
+			if !data.is_empty() {
+				let buffer = completion::Buffer::from(data.to_vec());
+				file.write_all_at(buffer, 0).await.map_err(engine_io)?;
+			}
+
+			Ok::<(), io::Error>(())
 		}
-		let buffer = completion::Buffer::from(data.to_vec());
-		file.write_all_at(buffer, 0)
-			.await
-			.map(|_| ())
-			.map_err(engine_io)
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = Volume::stat(self, path).await?;
+			for (name, raw) in idx.notify_write(path, &attr, data) {
+				let _result = Volume::setxattr(self, path, name, &raw, 0).await;
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn stat(&self, path: &Path) -> io::Result<Attr> {
@@ -1665,31 +1750,78 @@ impl Volume for PassthroughFs {
 	}
 
 	async fn create_dir(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| state.volume_create_dir(path))
+		async { self.with(|state| state.volume_create_dir(path)) }.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = Volume::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
+				}
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| state.volume_create_dir_all(path))
+		async { self.with(|state| state.volume_create_dir_all(path)) }.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = Volume::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
+				}
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_file(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| state.volume_remove_file(path))
+		async { self.with(|state| state.volume_remove_file(path)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| state.volume_remove_dir(path))
+		async { self.with(|state| state.volume_remove_dir(path)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_all(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| state.volume_remove_all(path))
+		async { self.with(|state| state.volume_remove_all(path)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-		self.with(|state| state.volume_rename(from, to))
+		async { self.with(|state| state.volume_rename(from, to)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_rename(from, to);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-		self.with(|state| state.volume_copy(from, to))
+		let result = async { self.with(|state| state.volume_copy(from, to)) }.await?;
+		if let Some(idx) = &self.index {
+			let attr = Volume::stat(self, to).await?;
+			let data = Volume::read(self, to).await?;
+			for (name, raw) in idx.notify_write(to, &attr, &data) {
+				let _result = Volume::setxattr(self, to, name, &raw, 0).await;
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(result)
 	}
 }
 
@@ -2336,5 +2468,11 @@ fn remove_tree(parent: &File, name: &CStr) -> io::Result<()> {
 		Ok(())
 	} else {
 		unlink(parent, name, false)
+	}
+}
+
+impl Search for PassthroughFs {
+	fn search_index(&self) -> Option<&SearchIndex> {
+		self.index.as_deref()
 	}
 }

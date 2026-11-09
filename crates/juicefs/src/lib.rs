@@ -35,9 +35,9 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Once};
 use std::thread::{self, JoinHandle};
 
 use api::{
@@ -45,6 +45,7 @@ use api::{
 	ListxattrReply, Snapshot, Volume as VolumeApi, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
 	name_to_path,
 };
+use api::{IndexOptions, Search, SearchIndex};
 use asyncband::oneshot;
 
 /// How many calls into Go run at once. The device serves every chain as its
@@ -232,11 +233,24 @@ fn auxv() -> Vec<*mut c_char> {
 	Vec::new()
 }
 
+/// Configuration passed to [`Volume::format`] to initialize a JuiceFS volume.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Format {
+	pub name: String,
+	pub storage: String,
+	pub bucket: String,
+	pub access_key: String,
+	pub secret_key: String,
+	pub session_token: String,
+	pub force: bool,
+}
+
 /// A mounted volume and the threads that serve it.
 ///
 /// Dropping it unmounts: the pool's threads see their queues close and end,
 /// and the Go-side session is released.
 pub struct Volume {
+	index: Option<Arc<SearchIndex>>,
 	handle: usize,
 	/// One queue per worker, and a cursor over them. A single shared queue
 	/// would have to be reached into exclusively by each worker, since the
@@ -253,6 +267,59 @@ pub struct Volume {
 type Job = Box<dyn FnOnce(usize) + Send>;
 
 impl Volume {
+	pub fn with_hook(mut self, hook: Arc<dyn api::VolumeHook>) -> Self {
+		if self.index.is_none() {
+			self.enable_index(IndexOptions::default());
+		}
+		self.index.as_ref().unwrap().register_hook(hook);
+		self
+	}
+
+	pub fn with_index(mut self, options: IndexOptions) -> Self {
+		self.enable_index(options);
+		self
+	}
+	pub fn enable_index(&mut self, options: IndexOptions) {
+		self.index = Some(Arc::new(SearchIndex::new(options)));
+	}
+
+	/// Formats (or idempotently initializes when `format.force == false`) the
+	/// JuiceFS volume at `meta_url`.
+	pub fn format(meta_url: &str, format: &Format) -> io::Result<()> {
+		start_runtime();
+		let c_str = |s: &str, label: &str| {
+			CString::new(s).map_err(|_| {
+				io::Error::new(io::ErrorKind::InvalidInput, format!("{label} has a NUL"))
+			})
+		};
+		let payload = c_str(meta_url, "metadata URL")?;
+		let name = c_str(&format.name, "volume name")?;
+		let storage = c_str(&format.storage, "storage")?;
+		let bucket = c_str(&format.bucket, "bucket")?;
+		let access_key = c_str(&format.access_key, "access_key")?;
+		let secret_key = c_str(&format.secret_key, "secret_key")?;
+		let session_token = c_str(&format.session_token, "session_token")?;
+		let mut error = 0usize;
+		// SAFETY: all CStrings outlive the call, and `error` is a valid out-pointer.
+		let code = unsafe {
+			binding::juicefs_format(
+				payload.as_ptr().cast_mut(),
+				name.as_ptr().cast_mut(),
+				storage.as_ptr().cast_mut(),
+				bucket.as_ptr().cast_mut(),
+				access_key.as_ptr().cast_mut(),
+				secret_key.as_ptr().cast_mut(),
+				session_token.as_ptr().cast_mut(),
+				c_int::from(format.force),
+				&mut error,
+			)
+		};
+		if code != 0 {
+			return Err(mount_error(error));
+		}
+		Ok(())
+	}
+
 	/// Mounts the volume `meta_url` names, caching chunks under `cache_dir`.
 	///
 	/// Starts the Go runtime if this is the process's first volume, and the
@@ -316,6 +383,7 @@ impl Volume {
 			queues,
 			next: AtomicUsize::new(0),
 			next_snapshot: AtomicU64::new(1),
+			index: None,
 			workers,
 		})
 	}
@@ -2414,6 +2482,76 @@ impl Fuse for Volume {
 }
 
 impl VolumeApi for Volume {
+	async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+		let path = path.to_path_buf();
+		let name = name.to_owned();
+		self.call(move |handle| {
+			let ctx = Ctx::default();
+			let ino = if split_path(&path)?.is_empty() {
+				ROOT_INO
+			} else {
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_lookup(handle, &ctx, parent, &name)?.ino
+			};
+			let mut out = 0;
+			let code = unsafe {
+				binding::juicefs_getxattr(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					name.as_ptr().cast_mut(),
+					u32::MAX,
+					&mut out,
+				)
+			};
+			take(code, out)
+		})
+		.await
+	}
+	async fn setxattr(&self, path: &Path, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+		let path = path.to_path_buf();
+		let name = name.to_owned();
+		let value = value.to_vec();
+		self.call(move |handle| {
+			let ctx = Ctx::default();
+			let ino = if split_path(&path)?.is_empty() {
+				ROOT_INO
+			} else {
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_lookup(handle, &ctx, parent, &name)?.ino
+			};
+			check(unsafe {
+				binding::juicefs_setxattr(
+					handle,
+					mut_ptr(&ctx),
+					ino,
+					name.as_ptr().cast_mut(),
+					value.as_ptr().cast_mut().cast(),
+					value.len(),
+					flags,
+				)
+			})
+		})
+		.await
+	}
+	async fn removexattr(&self, path: &Path, name: &CStr) -> io::Result<()> {
+		let path = path.to_path_buf();
+		let name = name.to_owned();
+		self.call(move |handle| {
+			let ctx = Ctx::default();
+			let ino = if split_path(&path)?.is_empty() {
+				ROOT_INO
+			} else {
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_lookup(handle, &ctx, parent, &name)?.ino
+			};
+			check(unsafe {
+				binding::juicefs_removexattr(handle, mut_ptr(&ctx), ino, name.as_ptr().cast_mut())
+			})
+		})
+		.await
+	}
+
 	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
 		let path = path.to_path_buf();
 		self.call(move |handle| {
@@ -2477,73 +2615,86 @@ impl VolumeApi for Volume {
 	}
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-		let path = path.to_path_buf();
-		let data = data.to_vec();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
-			let (ino, fh) = match sync_lookup(handle, &ctx, parent, &name) {
-				Ok(existing) => {
-					if existing.attr.typ == TYPE_DIRECTORY {
-						return Err(io::Error::from_raw_os_error(libc::EISDIR));
+		async {
+			let path = path.to_path_buf();
+			let data = data.to_vec();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				let (ino, fh) = match sync_lookup(handle, &ctx, parent, &name) {
+					Ok(existing) => {
+						if existing.attr.typ == TYPE_DIRECTORY {
+							return Err(io::Error::from_raw_os_error(libc::EISDIR));
+						}
+						if existing.attr.typ != TYPE_REGULAR {
+							return Err(io::Error::from_raw_os_error(libc::EPERM));
+						}
+						let mut opened = Entry::default();
+						let mut fh = 0u64;
+						check(unsafe {
+							binding::juicefs_open(
+								handle,
+								mut_ptr(&ctx),
+								existing.ino,
+								(libc::O_WRONLY | libc::O_TRUNC) as u32,
+								&mut opened,
+								&mut fh,
+							)
+						})?;
+						(existing.ino, fh)
 					}
-					if existing.attr.typ != TYPE_REGULAR {
-						return Err(io::Error::from_raw_os_error(libc::EPERM));
+					Err(_) => {
+						let mut created = Entry::default();
+						let mut fh = 0u64;
+						check(unsafe {
+							binding::juicefs_create(
+								handle,
+								mut_ptr(&ctx),
+								parent,
+								name.as_ptr().cast_mut(),
+								0o644,
+								0,
+								libc::O_WRONLY as u32,
+								&mut created,
+								&mut fh,
+							)
+						})?;
+						(created.ino, fh)
 					}
-					let mut opened = Entry::default();
-					let mut fh = 0u64;
+				};
+				let write_res = if data.is_empty() {
+					Ok(())
+				} else {
 					check(unsafe {
-						binding::juicefs_open(
+						binding::juicefs_write(
 							handle,
 							mut_ptr(&ctx),
-							existing.ino,
-							(libc::O_WRONLY | libc::O_TRUNC) as u32,
-							&mut opened,
-							&mut fh,
-						)
-					})?;
-					(existing.ino, fh)
-				}
-				Err(_) => {
-					let mut created = Entry::default();
-					let mut fh = 0u64;
-					check(unsafe {
-						binding::juicefs_create(
-							handle,
-							mut_ptr(&ctx),
-							parent,
-							name.as_ptr().cast_mut(),
-							0o644,
+							ino,
+							fh,
 							0,
-							libc::O_WRONLY as u32,
-							&mut created,
-							&mut fh,
+							data.as_ptr().cast::<c_char>().cast_mut(),
+							data.len(),
 						)
-					})?;
-					(created.ino, fh)
-				}
-			};
-			let write_res = if data.is_empty() {
+					})
+				};
+				let flush_res =
+					check(unsafe { binding::juicefs_flush(handle, mut_ptr(&ctx), ino, fh, 0) });
+				unsafe { binding::juicefs_release(handle, mut_ptr(&ctx), ino, fh) };
+				write_res.and(flush_res)?;
+
 				Ok(())
-			} else {
-				check(unsafe {
-					binding::juicefs_write(
-						handle,
-						mut_ptr(&ctx),
-						ino,
-						fh,
-						0,
-						data.as_ptr().cast::<c_char>().cast_mut(),
-						data.len(),
-					)
-				})
-			};
-			let flush_res =
-				check(unsafe { binding::juicefs_flush(handle, mut_ptr(&ctx), ino, fh, 0) });
-			unsafe { binding::juicefs_release(handle, mut_ptr(&ctx), ino, fh) };
-			write_res.and(flush_res)
-		})
-		.await
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = VolumeApi::stat(self, path).await?;
+			for (name, raw) in idx.notify_write(path, &attr, data) {
+				let _result = VolumeApi::setxattr(self, path, name, &raw, 0).await;
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn stat(&self, path: &Path) -> io::Result<api::Attr> {
@@ -2608,127 +2759,195 @@ impl VolumeApi for Volume {
 	}
 
 	async fn create_dir(&self, path: &Path) -> io::Result<()> {
-		let path = path.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
-			sync_mkdir(handle, &ctx, parent, &name, 0o755)?;
-			Ok(())
-		})
-		.await
+		async {
+			let path = path.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_mkdir(handle, &ctx, parent, &name, 0o755)?;
+				Ok(())
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = VolumeApi::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
+				}
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-		let path = path.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let parts = split_path(&path)?;
-			let mut current = ROOT_INO;
-			for part in &parts {
-				match sync_lookup(handle, &ctx, current, part) {
-					Ok(entry) => {
-						if entry.attr.typ != TYPE_DIRECTORY {
-							return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+		async {
+			let path = path.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let parts = split_path(&path)?;
+				let mut current = ROOT_INO;
+				for part in &parts {
+					match sync_lookup(handle, &ctx, current, part) {
+						Ok(entry) => {
+							if entry.attr.typ != TYPE_DIRECTORY {
+								return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+							}
+							current = entry.ino;
 						}
-						current = entry.ino;
+						Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+							current = sync_mkdir(handle, &ctx, current, part, 0o755)?.ino;
+						}
+						Err(error) => return Err(error),
 					}
-					Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-						current = sync_mkdir(handle, &ctx, current, part, 0o755)?.ino;
-					}
-					Err(error) => return Err(error),
+				}
+				Ok(())
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = VolumeApi::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
 				}
 			}
-			Ok(())
-		})
-		.await
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_file(&self, path: &Path) -> io::Result<()> {
-		let path = path.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
-			sync_unlink(handle, &ctx, parent, &name)
-		})
-		.await
+		async {
+			let path = path.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_unlink(handle, &ctx, parent, &name)
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
-		let path = path.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
-			sync_rmdir(handle, &ctx, parent, &name)
-		})
-		.await
+		async {
+			let path = path.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_rmdir(handle, &ctx, parent, &name)
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_all(&self, path: &Path) -> io::Result<()> {
-		let path = path.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let parts = split_path(&path)?;
-			if parts.is_empty() {
-				for entry in sync_readdir_all(handle, &ctx, ROOT_INO)? {
-					if let Ok(c_name) = CString::new(entry.name) {
-						sync_remove_subtree(handle, &ctx, ROOT_INO, &c_name)?;
+		async {
+			let path = path.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let parts = split_path(&path)?;
+				if parts.is_empty() {
+					for entry in sync_readdir_all(handle, &ctx, ROOT_INO)? {
+						if let Ok(c_name) = CString::new(entry.name) {
+							sync_remove_subtree(handle, &ctx, ROOT_INO, &c_name)?;
+						}
 					}
+					return Ok(());
 				}
-				return Ok(());
-			}
-			let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
-			sync_remove_subtree(handle, &ctx, parent, &name)
-		})
-		.await
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path)?;
+				sync_remove_subtree(handle, &ctx, parent, &name)
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-		let from = from.to_path_buf();
-		let to = to.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let (old_parent, old_name) = sync_resolve_parent(handle, &ctx, &from)?;
-			let (new_parent, new_name) = sync_resolve_parent(handle, &ctx, &to)?;
-			check(unsafe {
-				binding::juicefs_rename(
-					handle,
-					mut_ptr(&ctx),
-					old_parent,
-					old_name.as_ptr().cast_mut(),
-					new_parent,
-					new_name.as_ptr().cast_mut(),
-					0,
-				)
+		async {
+			let from = from.to_path_buf();
+			let to = to.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let (old_parent, old_name) = sync_resolve_parent(handle, &ctx, &from)?;
+				let (new_parent, new_name) = sync_resolve_parent(handle, &ctx, &to)?;
+				check(unsafe {
+					binding::juicefs_rename(
+						handle,
+						mut_ptr(&ctx),
+						old_parent,
+						old_name.as_ptr().cast_mut(),
+						new_parent,
+						new_name.as_ptr().cast_mut(),
+						0,
+					)
+				})
 			})
-		})
-		.await
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_rename(from, to);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-		let from = from.to_path_buf();
-		let to = to.to_path_buf();
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let (src_parent, src_name) = sync_resolve_parent(handle, &ctx, &from)?;
-			let src_entry = sync_lookup(handle, &ctx, src_parent, &src_name)?;
-			if src_entry.attr.typ == TYPE_DIRECTORY {
-				return Err(io::Error::from_raw_os_error(libc::EISDIR));
+		let result = async {
+			let from = from.to_path_buf();
+			let to = to.to_path_buf();
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let (src_parent, src_name) = sync_resolve_parent(handle, &ctx, &from)?;
+				let src_entry = sync_lookup(handle, &ctx, src_parent, &src_name)?;
+				if src_entry.attr.typ == TYPE_DIRECTORY {
+					return Err(io::Error::from_raw_os_error(libc::EISDIR));
+				}
+				if src_entry.attr.typ != TYPE_REGULAR {
+					return Err(io::Error::from_raw_os_error(libc::EPERM));
+				}
+				let (dst_parent, dst_name) = sync_resolve_parent(handle, &ctx, &to)?;
+				sync_copy_file(
+					handle,
+					&ctx,
+					src_entry.ino,
+					src_entry.attr.length,
+					dst_parent,
+					&dst_name,
+					u32::from(src_entry.attr.mode),
+				)
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = VolumeApi::stat(self, to).await?;
+			let data = VolumeApi::read(self, to).await?;
+			for (name, raw) in idx.notify_write(to, &attr, &data) {
+				let _result = VolumeApi::setxattr(self, to, name, &raw, 0).await;
 			}
-			if src_entry.attr.typ != TYPE_REGULAR {
-				return Err(io::Error::from_raw_os_error(libc::EPERM));
-			}
-			let (dst_parent, dst_name) = sync_resolve_parent(handle, &ctx, &to)?;
-			sync_copy_file(
-				handle,
-				&ctx,
-				src_entry.ino,
-				src_entry.attr.length,
-				dst_parent,
-				&dst_name,
-				u32::from(src_entry.attr.mode),
-			)
-		})
-		.await
+			idx.persist_roots(self).await;
+		}
+		Ok(result)
 	}
 }
 
@@ -2753,19 +2972,26 @@ impl Snapshot for Volume {
 	}
 
 	async fn restore(&self, id: &u64) -> io::Result<()> {
-		let snap_name = CString::new(format!("snap-{id}")).expect("no NUL");
-		self.call(move |handle| {
-			let ctx = Ctx::default();
-			let pool_ino = sync_lookup(handle, &ctx, ROOT_INO, SNAPSHOT_DIR_NAME)?.ino;
-			let snap_entry = sync_lookup(handle, &ctx, pool_ino, &snap_name)?;
-			for entry in sync_readdir_all(handle, &ctx, ROOT_INO)? {
-				if let Ok(c_name) = CString::new(entry.name) {
-					sync_remove_subtree(handle, &ctx, ROOT_INO, &c_name)?;
+		async {
+			let snap_name = CString::new(format!("snap-{id}")).expect("no NUL");
+			self.call(move |handle| {
+				let ctx = Ctx::default();
+				let pool_ino = sync_lookup(handle, &ctx, ROOT_INO, SNAPSHOT_DIR_NAME)?.ino;
+				let snap_entry = sync_lookup(handle, &ctx, pool_ino, &snap_name)?;
+				for entry in sync_readdir_all(handle, &ctx, ROOT_INO)? {
+					if let Ok(c_name) = CString::new(entry.name) {
+						sync_remove_subtree(handle, &ctx, ROOT_INO, &c_name)?;
+					}
 				}
-			}
-			sync_clone_dir(handle, &ctx, snap_entry.ino, ROOT_INO)
-		})
-		.await
+				sync_clone_dir(handle, &ctx, snap_entry.ino, ROOT_INO)
+			})
+			.await
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_reset();
+		}
+		Ok(())
 	}
 
 	async fn delete(&self, id: &u64) -> io::Result<()> {
@@ -2786,6 +3012,12 @@ impl Snapshot for Volume {
 			sync_diff(handle, &ctx, id, &scope)
 		})
 		.await
+	}
+}
+
+impl Search for Volume {
+	fn search_index(&self) -> Option<&SearchIndex> {
+		self.index.as_deref()
 	}
 }
 

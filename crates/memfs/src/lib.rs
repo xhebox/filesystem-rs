@@ -25,6 +25,7 @@ use api::{
 	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
 	diff_volumes, name_to_path,
 };
+use api::{FileSignatures, IndexOptions, Search, SearchIndex};
 use imbl::{HashMap as ImHashMap, OrdMap, Vector};
 
 const PAGE_SIZE: usize = 4096;
@@ -208,6 +209,7 @@ struct FsState {
 /// An in-memory file system with $O(1)$ Copy-on-Write snapshots and page-level
 /// data sharing.
 pub struct MemFs {
+	index: Option<Arc<SearchIndex>>,
 	state: RefCell<FsState>,
 }
 
@@ -218,9 +220,27 @@ impl Default for MemFs {
 }
 
 impl MemFs {
+	pub fn with_hook(mut self, hook: Arc<dyn api::VolumeHook>) -> Self {
+		if self.index.is_none() {
+			self.enable_index(IndexOptions::default());
+		}
+		self.index.as_ref().unwrap().register_hook(hook);
+		self
+	}
+
+	pub fn with_index(mut self, options: IndexOptions) -> Self {
+		self.enable_index(options);
+		self
+	}
+
+	pub fn enable_index(&mut self, options: IndexOptions) {
+		self.index = Some(Arc::new(SearchIndex::new(options)));
+	}
+
 	/// Creates a new empty in-memory file system.
 	pub fn new(read_only: bool) -> Self {
 		Self {
+			index: None,
 			state: RefCell::new(FsState {
 				read_only,
 				tree: TreeState::new(),
@@ -946,6 +966,16 @@ impl FsState {
 	}
 }
 
+fn mark_modified(node: &mut Node) {
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default();
+	let next = (u128::from(node.attr.mtime) * 1_000_000_000 + u128::from(node.attr.mtimensec) + 1)
+		.max(now.as_nanos());
+	node.attr.mtime = (next / 1_000_000_000) as u64;
+	node.attr.mtimensec = (next % 1_000_000_000) as u32;
+}
+
 fn truncate_node(node: &mut Node, size: u64) -> io::Result<()> {
 	let NodeKind::File { pages } = &mut node.kind else {
 		return Err(errno(libc::EISDIR));
@@ -963,6 +993,7 @@ fn truncate_node(node: &mut Node, size: u64) -> io::Result<()> {
 	}
 	node.attr.size = size;
 	node.attr.blocks = size.div_ceil(512);
+	mark_modified(node);
 	Ok(())
 }
 
@@ -996,6 +1027,7 @@ fn write_into_node(node: &mut Node, offset: u64, data: &[u8]) -> io::Result<usiz
 		node.attr.size = end;
 		node.attr.blocks = end.div_ceil(512);
 	}
+	mark_modified(node);
 	Ok(written)
 }
 
@@ -1384,6 +1416,40 @@ impl Fuse for MemFs {
 }
 
 impl Volume for MemFs {
+	async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+		self.with(|state| {
+			let ino = if split_path(path)?.is_empty() {
+				ROOT_ID
+			} else {
+				let (parent, name) = state.resolve_parent(path)?;
+				state.lookup_child(parent, &name)?
+			};
+			state.get_xattr(ino, Some(name), 0)
+		})
+	}
+	async fn setxattr(&self, path: &Path, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+		self.with(|state| {
+			let ino = if split_path(path)?.is_empty() {
+				ROOT_ID
+			} else {
+				let (parent, name) = state.resolve_parent(path)?;
+				state.lookup_child(parent, &name)?
+			};
+			state.set_xattr(ino, name, value, flags)
+		})
+	}
+	async fn removexattr(&self, path: &Path, name: &CStr) -> io::Result<()> {
+		self.with(|state| {
+			let ino = if split_path(path)?.is_empty() {
+				ROOT_ID
+			} else {
+				let (parent, name) = state.resolve_parent(path)?;
+				state.lookup_child(parent, &name)?
+			};
+			state.remove_xattr(ino, name)
+		})
+	}
+
 	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
 		self.with(|state| {
 			let (parent, name) = state.resolve_parent(path)?;
@@ -1431,39 +1497,51 @@ impl Volume for MemFs {
 	}
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let (parent, name) = state.resolve_parent(path)?;
-			let ino = match state.lookup_child(parent, &name) {
-				Ok(ino) => {
-					let node = state.tree.node_mut(ino)?;
-					if node.is_dir() {
-						return Err(errno(libc::EISDIR));
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let (parent, name) = state.resolve_parent(path)?;
+				let ino = match state.lookup_child(parent, &name) {
+					Ok(ino) => {
+						let node = state.tree.node_mut(ino)?;
+						if node.is_dir() {
+							return Err(errno(libc::EISDIR));
+						}
+						if !node.is_file() {
+							return Err(errno(libc::EPERM));
+						}
+						truncate_node(node, 0)?;
+						ino
 					}
-					if !node.is_file() {
-						return Err(errno(libc::EPERM));
+					Err(_) => {
+						state
+							.create_node(
+								&Context::default(),
+								parent,
+								&name,
+								S_IFREG | 0o644,
+								0,
+								NodeKind::File {
+									pages: Vector::new(),
+								},
+							)?
+							.inode
 					}
-					truncate_node(node, 0)?;
-					ino
-				}
-				Err(_) => {
-					state
-						.create_node(
-							&Context::default(),
-							parent,
-							&name,
-							S_IFREG | 0o644,
-							0,
-							NodeKind::File {
-								pages: Vector::new(),
-							},
-						)?
-						.inode
-				}
-			};
-			state.write_slice(ino, 0, data)?;
-			Ok(())
-		})
+				};
+				state.write_slice(ino, 0, data)?;
+
+				Ok(())
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = Volume::stat(self, path).await?;
+			for (name, raw) in idx.notify_write(path, &attr, data) {
+				let _result = Volume::setxattr(self, path, name, &raw, 0).await;
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn stat(&self, path: &Path) -> io::Result<Attr> {
@@ -1523,122 +1601,192 @@ impl Volume for MemFs {
 	}
 
 	async fn create_dir(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			let (parent, name) = state.resolve_parent(path)?;
-			state.mkdir(&Context::default(), parent, &name, 0o755, 0)?;
-			Ok(())
-		})
+		async {
+			self.with(|state| {
+				let (parent, name) = state.resolve_parent(path)?;
+				state.mkdir(&Context::default(), parent, &name, 0o755, 0)?;
+				Ok(())
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = Volume::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
+				}
+			}
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let parts = split_path(path)?;
-			let mut current = ROOT_ID;
-			for part in parts {
-				match state.lookup_child(current, &part) {
-					Ok(next) => {
-						if !state.tree.node(next)?.is_dir() {
-							return Err(errno(libc::ENOTDIR));
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let parts = split_path(path)?;
+				let mut current = ROOT_ID;
+				for part in parts {
+					match state.lookup_child(current, &part) {
+						Ok(next) => {
+							if !state.tree.node(next)?.is_dir() {
+								return Err(errno(libc::ENOTDIR));
+							}
+							current = next;
 						}
-						current = next;
-					}
-					Err(_) => {
-						current = state
-							.mkdir(&Context::default(), current, &part, 0o755, 0)?
-							.inode;
+						Err(_) => {
+							current = state
+								.mkdir(&Context::default(), current, &part, 0o755, 0)?
+								.inode;
+						}
 					}
 				}
+				Ok(())
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+				if let Ok(attr) = Volume::stat(self, dir).await {
+					idx.notify_mkdir(dir, &attr);
+				}
 			}
-			Ok(())
-		})
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_file(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			let (parent, name) = state.resolve_parent(path)?;
-			state.unlink(parent, &name, false)
-		})
+		async {
+			self.with(|state| {
+				let (parent, name) = state.resolve_parent(path)?;
+				state.unlink(parent, &name, false)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			let (parent, name) = state.resolve_parent(path)?;
-			state.unlink(parent, &name, true)
-		})
+		async {
+			self.with(|state| {
+				let (parent, name) = state.resolve_parent(path)?;
+				state.unlink(parent, &name, true)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn remove_all(&self, path: &Path) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let parts = split_path(path)?;
-			if parts.is_empty() {
-				let names: Vec<Vec<u8>> = match &state.tree.node(ROOT_ID)?.kind {
-					NodeKind::Dir { entries, .. } => entries.keys().cloned().collect(),
-					_ => Vec::new(),
-				};
-				for name in names {
-					state.remove_subtree(ROOT_ID, &name)?;
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let parts = split_path(path)?;
+				if parts.is_empty() {
+					let names: Vec<Vec<u8>> = match &state.tree.node(ROOT_ID)?.kind {
+						NodeKind::Dir { entries, .. } => entries.keys().cloned().collect(),
+						_ => Vec::new(),
+					};
+					for name in names {
+						state.remove_subtree(ROOT_ID, &name)?;
+					}
+					return Ok(());
 				}
-				return Ok(());
-			}
-			let (parent, name) = state.resolve_parent(path)?;
-			state.remove_subtree(parent, &name)
-		})
+				let (parent, name) = state.resolve_parent(path)?;
+				state.remove_subtree(parent, &name)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_remove(path);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-		self.with(|state| {
-			let (old_parent, old_name) = state.resolve_parent(from)?;
-			let (new_parent, new_name) = state.resolve_parent(to)?;
-			state.rename(old_parent, &old_name, new_parent, &new_name, 0)
-		})
+		async {
+			self.with(|state| {
+				let (old_parent, old_name) = state.resolve_parent(from)?;
+				let (new_parent, new_name) = state.resolve_parent(to)?;
+				state.rename(old_parent, &old_name, new_parent, &new_name, 0)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_rename(from, to);
+			idx.persist_roots(self).await;
+		}
+		Ok(())
 	}
 
 	async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-		self.with(|state| {
-			state.writable()?;
-			let (src_parent, src_name) = state.resolve_parent(from)?;
-			let src_ino = state.lookup_child(src_parent, &src_name)?;
-			let (pages, size, mode) = {
-				let src = state.tree.node(src_ino)?;
-				let NodeKind::File { pages } = &src.kind else {
-					return Err(if src.is_dir() {
-						errno(libc::EISDIR)
-					} else {
-						errno(libc::EINVAL)
-					});
+		let result = async {
+			self.with(|state| {
+				state.writable()?;
+				let (src_parent, src_name) = state.resolve_parent(from)?;
+				let src_ino = state.lookup_child(src_parent, &src_name)?;
+				let (pages, size, mode) = {
+					let src = state.tree.node(src_ino)?;
+					let NodeKind::File { pages } = &src.kind else {
+						return Err(if src.is_dir() {
+							errno(libc::EISDIR)
+						} else {
+							errno(libc::EINVAL)
+						});
+					};
+					(pages.clone(), src.attr.size, src.attr.mode)
 				};
-				(pages.clone(), src.attr.size, src.attr.mode)
-			};
 
-			let (dst_parent, dst_name) = state.resolve_parent(to)?;
-			match state.lookup_child(dst_parent, &dst_name) {
-				Ok(dst_ino) => {
-					let dst = state.tree.node_mut(dst_ino)?;
-					if dst.is_dir() {
-						return Err(errno(libc::EISDIR));
+				let (dst_parent, dst_name) = state.resolve_parent(to)?;
+				match state.lookup_child(dst_parent, &dst_name) {
+					Ok(dst_ino) => {
+						let dst = state.tree.node_mut(dst_ino)?;
+						if dst.is_dir() {
+							return Err(errno(libc::EISDIR));
+						}
+						dst.kind = NodeKind::File { pages };
+						dst.attr.size = size;
+						dst.attr.blocks = size.div_ceil(512);
+						mark_modified(dst);
 					}
-					dst.kind = NodeKind::File { pages };
-					dst.attr.size = size;
-					dst.attr.blocks = size.div_ceil(512);
+					Err(_) => {
+						let entry = state.create_node(
+							&Context::default(),
+							dst_parent,
+							&dst_name,
+							mode,
+							0,
+							NodeKind::File { pages },
+						)?;
+						let dst = state.tree.node_mut(entry.inode)?;
+						dst.attr.size = size;
+						dst.attr.blocks = size.div_ceil(512);
+						mark_modified(dst);
+					}
 				}
-				Err(_) => {
-					let entry = state.create_node(
-						&Context::default(),
-						dst_parent,
-						&dst_name,
-						mode,
-						0,
-						NodeKind::File { pages },
-					)?;
-					let dst = state.tree.node_mut(entry.inode)?;
-					dst.attr.size = size;
-					dst.attr.blocks = size.div_ceil(512);
-				}
+				Ok(size)
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			let attr = Volume::stat(self, to).await?;
+			let data = Volume::read(self, to).await?;
+			for (name, raw) in idx.notify_write(to, &attr, &data) {
+				let _result = Volume::setxattr(self, to, name, &raw, 0).await;
 			}
-			Ok(size)
-		})
+			idx.persist_roots(self).await;
+		}
+		Ok(result)
 	}
 }
 
@@ -1669,6 +1817,10 @@ impl Snapshot for MemFs {
 				.cloned()
 				.ok_or_else(|| errno(libc::ENOENT))?;
 			Ok(Self {
+				index: self
+					.index
+					.as_ref()
+					.map(|i| Arc::new(SearchIndex::new(*i.options()))),
 				state: RefCell::new(FsState {
 					read_only: false,
 					tree,
@@ -1681,19 +1833,26 @@ impl Snapshot for MemFs {
 	}
 
 	async fn restore(&self, id: &u64) -> io::Result<()> {
-		self.with(|state| {
-			state.writable()?;
-			let tree = state
-				.store
-				.snapshots
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.get(id)
-				.cloned()
-				.ok_or_else(|| errno(libc::ENOENT))?;
-			state.tree = tree;
-			Ok(())
-		})
+		async {
+			self.with(|state| {
+				state.writable()?;
+				let tree = state
+					.store
+					.snapshots
+					.lock()
+					.unwrap_or_else(|e| e.into_inner())
+					.get(id)
+					.cloned()
+					.ok_or_else(|| errno(libc::ENOENT))?;
+				state.tree = tree;
+				Ok(())
+			})
+		}
+		.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_reset();
+		}
+		Ok(())
 	}
 
 	async fn delete(&self, id: &u64) -> io::Result<()> {
@@ -1720,6 +1879,10 @@ impl Snapshot for MemFs {
 				.cloned()
 				.ok_or_else(|| errno(libc::ENOENT))?;
 			Ok(Self {
+				index: self
+					.index
+					.as_ref()
+					.map(|i| Arc::new(SearchIndex::new(*i.options()))),
 				state: RefCell::new(FsState {
 					read_only: true,
 					tree,
@@ -1780,8 +1943,241 @@ fn errno(code: libc::c_int) -> io::Error {
 	io::Error::from_raw_os_error(code)
 }
 
+impl Search for MemFs {
+	fn search_index(&self) -> Option<&SearchIndex> {
+		self.index.as_deref()
+	}
+	async fn native_page_signatures(
+		&self,
+		path: &Path,
+		attr: &Attr,
+	) -> io::Result<Option<Vec<api::PageSig>>> {
+		Ok(self
+			.native_file_signatures(path, attr)
+			.await?
+			.map(|s| s.pages))
+	}
+	async fn native_file_signatures(
+		&self,
+		path: &Path,
+		_attr: &Attr,
+	) -> io::Result<Option<FileSignatures>> {
+		self.with(|state| {
+			let (parent, name) = state.resolve_parent(path)?;
+			let ino = state.lookup_child(parent, &name)?;
+			let node = state.tree.node(ino)?;
+			let NodeKind::File { pages } = &node.kind else {
+				return Ok(None);
+			};
+			let size = node.attr.size as usize;
+			let mut sigs = FileSignatures {
+				pages: Vec::new(),
+				newlines: Vec::new(),
+			};
+			for p in 0..size.div_ceil(PAGE_SIZE) {
+				let start = p * PAGE_SIZE;
+				let end = (start + PAGE_SIZE + api::SEARCH_OVERLAP).min(size);
+				let mut window = Vec::with_capacity(end - start);
+				for offset in start..end {
+					window.push(
+						pages
+							.get(offset / PAGE_SIZE)
+							.and_then(|p| p.as_ref())
+							.map_or(0, |p| p[offset % PAGE_SIZE]),
+					);
+				}
+				if window.contains(&0) {
+					return Ok(Some(FileSignatures {
+						pages: Vec::new(),
+						newlines: Vec::new(),
+					}));
+				}
+				sigs.pages.push(api::compute_page_sig(&window));
+				sigs.newlines.push(
+					window[..PAGE_SIZE.min(size - start)]
+						.iter()
+						.filter(|&&b| b == b'\n')
+						.count() as u16,
+				);
+			}
+			Ok(Some(sigs))
+		})
+	}
+}
+
 #[cfg(test)]
 mod tests {
+	use api::XATTR_SIG_NAME;
+	#[test]
+	fn indexed_search_short_folded_binary_and_multiple_groups() {
+		block_on(async {
+			for options in [IndexOptions::default(), IndexOptions::disabled()] {
+				let fs = MemFs::new(false).with_index(options);
+				let path = Path::new("/text");
+				let mut data = b"padding\n".repeat(40960);
+				data.extend_from_slice("préfix MixedCase!\n".as_bytes());
+				Volume::write(&fs, path, &data).await.unwrap();
+				let found = fs
+					.search(
+						Path::new("/"),
+						&api::SearchQuery::case_insensitive("mixedcase"),
+					)
+					.await
+					.unwrap();
+				assert_eq!(found.len(), 1);
+				assert_eq!((found[0].line, found[0].column), (40961, 9));
+				assert!(
+					fs.search(Path::new("/"), &api::SearchQuery::new("mixedcase"))
+						.await
+						.unwrap()
+						.is_empty()
+				);
+				assert_eq!(
+					fs.search(Path::new("/"), &api::SearchQuery::new("!"))
+						.await
+						.unwrap()
+						.len(),
+					1
+				);
+				assert!(
+					fs.search(Path::new("/missing"), &api::SearchQuery::new(""))
+						.await
+						.unwrap()
+						.is_empty()
+				);
+				Volume::write(&fs, path, b"binary\0MixedCase")
+					.await
+					.unwrap();
+				assert!(
+					fs.search(Path::new("/"), &api::SearchQuery::new("MixedCase"))
+						.await
+						.unwrap()
+						.is_empty()
+				);
+			}
+		});
+	}
+
+	#[test]
+	fn path_xattrs_and_indexed_search_snapshot() {
+		let fs = MemFs::new(false).with_index(IndexOptions::default());
+		block_on(async {
+			let path = Path::new("/text");
+			let mut data = b"padding padding\n".repeat(1600);
+			data.extend_from_slice(b"before Needle after\n");
+			Volume::write(&fs, path, &data).await.unwrap();
+			Volume::setxattr(&fs, path, c"user.test", b"value", 0)
+				.await
+				.unwrap();
+			assert_eq!(
+				Volume::getxattr(&fs, path, c"user.test").await.unwrap(),
+				b"value"
+			);
+			Volume::removexattr(&fs, path, c"user.test").await.unwrap();
+			assert!(Volume::getxattr(&fs, path, c"user.test").await.is_err());
+			let attr = Volume::stat(&fs, path).await.unwrap();
+			let raw = Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap();
+			assert_eq!(
+				api::decode_sig_xattr(&attr, &raw),
+				Some(FileSignatures::compute(&data))
+			);
+			let id = fs.snapshot().await.unwrap();
+			let found = fs
+				.search(Path::new("/"), &api::SearchQuery::new("Needle"))
+				.await
+				.unwrap();
+			assert_eq!(found.len(), 1);
+			assert_eq!((found[0].line, found[0].column), (1601, 8));
+			assert_eq!(found[0].line_text, "before Needle after");
+			Volume::write(&fs, path, b"replacement\n").await.unwrap();
+			assert!(
+				fs.search(Path::new("/"), &api::SearchQuery::new("Needle"))
+					.await
+					.unwrap()
+					.is_empty()
+			);
+			fs.restore(&id).await.unwrap();
+			assert_eq!(
+				Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap(),
+				raw
+			);
+			assert_eq!(
+				fs.search(Path::new("/"), &api::SearchQuery::new("Needle"))
+					.await
+					.unwrap(),
+				found
+			);
+			let branch = fs.branch(&id).await.unwrap();
+			assert!(branch.search_index().is_some());
+		});
+	}
+
+	struct SearchReads<'a> {
+		fs: &'a MemFs,
+		ranges: RefCell<Vec<(u64, usize)>>,
+	}
+
+	impl Volume for SearchReads<'_> {
+		async fn walk(&self, path: &Path) -> io::Result<Vec<WalkEntry>> {
+			self.fs.walk(path).await
+		}
+		async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+			Volume::getxattr(self.fs, path, name).await
+		}
+		async fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+			panic!("indexed search must not read the whole file")
+		}
+		async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+			self.ranges.borrow_mut().push((offset, len));
+			self.fs.read_range(path, offset, len.min(97)).await
+		}
+	}
+
+	impl Search for SearchReads<'_> {
+		fn search_index(&self) -> Option<&SearchIndex> {
+			self.fs.search_index()
+		}
+	}
+
+	#[test]
+	fn indexed_ranges_skip_pages_and_handle_long_boundary_matches() {
+		block_on(async {
+			let fs = MemFs::new(false).with_index(IndexOptions::default());
+			let mut data = b"a\n".repeat(16 * 4096);
+			let needle = "UniqueBoundary".repeat(12);
+			let pos = 12 * 4096 - 5;
+			data.splice(pos..pos + needle.len(), needle.bytes());
+			Volume::write(&fs, Path::new("/text"), &data).await.unwrap();
+			fs.search_index().unwrap().clear();
+			let counted = SearchReads {
+				fs: &fs,
+				ranges: RefCell::new(Vec::new()),
+			};
+			let found = counted
+				.search(Path::new("/"), &api::SearchQuery::new(&needle))
+				.await
+				.unwrap();
+			assert_eq!(found.len(), 1);
+			assert_eq!((found[0].line, found[0].column), (pos / 2 + 1, 2));
+			assert!(
+				counted
+					.ranges
+					.borrow()
+					.iter()
+					.all(|&(start, _)| start >= 10 * 4096)
+			);
+			counted.ranges.borrow_mut().clear();
+			assert!(
+				counted
+					.search(Path::new("/"), &api::SearchQuery::new("ZZnotpresentZZ"))
+					.await
+					.unwrap()
+					.is_empty()
+			);
+			assert!(counted.ranges.borrow().is_empty());
+		});
+	}
+
 	use std::future::Future;
 	use std::path::Path;
 	use std::sync::Arc;
@@ -1796,7 +2192,7 @@ mod tests {
 
 	const O_RDWR: u32 = 2;
 
-	fn block_on<F: Future>(future: F) -> F::Output {
+	pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 		let mut future = std::pin::pin!(future);
 		let mut cx = TaskContext::from_waker(Waker::noop());
 		loop {
@@ -2296,8 +2692,8 @@ mod tests {
 		assert_eq!(linked.inode, entry.inode);
 		assert_eq!(linked.attr.nlink, 2);
 
-		block_on(fs.setxattr(&ctx, entry.inode, c"user.k", b"v", 0)).unwrap();
-		match block_on(fs.getxattr(&ctx, entry.inode, c"user.k", 10)).unwrap() {
+		block_on(Fuse::setxattr(&fs, &ctx, entry.inode, c"user.k", b"v", 0)).unwrap();
+		match block_on(Fuse::getxattr(&fs, &ctx, entry.inode, c"user.k", 10)).unwrap() {
 			GetxattrReply::Value(v) => assert_eq!(v, b"v"),
 			GetxattrReply::Size(_) => panic!("expected value"),
 		}
@@ -2311,3 +2707,6 @@ mod tests {
 		block_on(fs.release(&ctx, linked.inode, 0, fh2)).unwrap();
 	}
 }
+
+#[cfg(test)]
+mod search_tests;
