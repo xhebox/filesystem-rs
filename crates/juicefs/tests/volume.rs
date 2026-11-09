@@ -151,8 +151,9 @@ fn walk_read_range_and_diff() {
 
 #[test]
 fn format_and_mount_isolated_sqlite_volumes() {
-	let dir =
-		std::env::temp_dir().join(format!("boxfs-juicefs-format-test-{}", std::process::id()));
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../target/test-tmp")
+		.join(format!("boxfs-juicefs-format-test-{}", std::process::id()));
 	drop(fs::remove_dir_all(&dir));
 	let owner_a = dir.join("owner-a");
 	let owner_b = dir.join("owner-b");
