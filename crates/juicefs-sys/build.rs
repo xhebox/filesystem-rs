@@ -18,9 +18,10 @@ const BASE_URL: &str = "https://github.com/xhebox/filesystem-rs/releases/downloa
 fn main() {
 	println!("cargo:rerun-if-env-changed=JUICEFS_SYS_CACHE");
 
-	let target = env::var("TARGET").expect("cargo sets TARGET");
+	let target_os = env::var("CARGO_CFG_TARGET_OS").expect("cargo sets CARGO_CFG_TARGET_OS");
+	let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets CARGO_CFG_TARGET_ARCH");
 	let version = env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
-	let lib = format!("juicefs-{target}");
+	let lib = format!("juicefs-{target_os}-{target_arch}");
 	let name = format!("lib{lib}.a");
 	let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"))
 		.join(format!("v{version}"))

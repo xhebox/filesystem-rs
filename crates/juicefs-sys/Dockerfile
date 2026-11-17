@@ -3,9 +3,9 @@
 #
 #   docker build --target artifact --output type=local,dest=DIR crates/juicefs-sys
 #
-# writes libjuicefs-<arch>-unknown-linux-musl.a into DIR (or
-# libjuicefs-aarch64-linux-android.a with `--build-arg TARGET_OS=android`).
-# These are the target-triple names used by boxfs-juicefs-sys releases.
+# writes libjuicefs-linux-<arch>.a into DIR (or
+# libjuicefs-android-aarch64.a with `--build-arg TARGET_OS=android`).
+# These are the {os}-{arch} names used by boxfs-juicefs-sys releases.
 #
 # Go's module and build caches are BuildKit cache mounts, so after an edit only
 # what changed is compiled again.
@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	&& ld -r -dc --whole-archive /out/libjuicefs.a -o /out/juicefs.o \
 	&& objcopy --strip-debug --wildcard --keep-global-symbol='juicefs_*' \
 		/out/juicefs.o \
-	&& ar rcs "/out/libjuicefs-$(uname -m)-unknown-linux-musl.a" /out/juicefs.o
+	&& ar rcs "/out/libjuicefs-linux-$(uname -m).a" /out/juicefs.o
 
 # Go's platform table rejects `-buildmode=c-archive` for `GOOS=android`, so the
 # archive is built as `GOOS=linux GOARCH=arm64` with the Android NDK's clang and
@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	&& llvm-objcopy --strip-debug --globalize-symbol=juicefs_rt0 \
 		--wildcard --keep-global-symbol='juicefs_*' \
 		/out/juicefs.o \
-	&& llvm-ar rcs /out/libjuicefs-aarch64-linux-android.a /out/juicefs.o
+	&& llvm-ar rcs /out/libjuicefs-android-aarch64.a /out/juicefs.o
 
 FROM build-${TARGET_OS} AS selected
 

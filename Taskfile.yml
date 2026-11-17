@@ -1,10 +1,11 @@
 version: '3'
 
 vars:
+  # The archive's name as `build.rs` spells it. go-task's OS and ARCH are Go's.
+  HOST_RUST_OS: '{{if eq OS "darwin"}}macos{{else}}{{OS}}{{end}}'
   HOST_RUST_ARCH: '{{if eq ARCH "amd64"}}x86_64{{else if eq ARCH "arm64"}}aarch64{{else}}{{ARCH}}{{end}}'
-  HOST_RUST_TARGET: '{{.HOST_RUST_ARCH}}-{{if eq OS "linux"}}unknown-linux-musl{{else if eq OS "darwin"}}apple-darwin{{else if eq OS "windows"}}pc-windows-msvc{{end}}'
   DIR: '{{.ROOT_DIR}}/target/juicefs-sys'
-  ARCHIVE: '{{.DIR}}/libjuicefs-{{.HOST_RUST_TARGET}}.a'
+  ARCHIVE: '{{.DIR}}/libjuicefs-{{.HOST_RUST_OS}}-{{.HOST_RUST_ARCH}}.a'
   TARGETS: x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-linux-android
 
 tasks:
