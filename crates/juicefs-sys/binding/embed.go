@@ -109,8 +109,8 @@ func juicefs_format(payload, name, storage, bucket, accessKey, secretKey, sessio
 // caller reads with the `juicefs_bytes_*` functions and releases.
 //
 //export juicefs_mount
-func juicefs_mount(payload, cacheDir *C.char, err *C.uintptr_t) C.uintptr_t {
-	v, mountErr := buildVFS(C.GoString(payload), C.GoString(cacheDir))
+func juicefs_mount(payload, cacheDir *C.char, readOnly C.int, err *C.uintptr_t) C.uintptr_t {
+	v, mountErr := buildVFS(C.GoString(payload), C.GoString(cacheDir), readOnly != 0)
 	if mountErr != nil {
 		*err = newBytes([]byte(mountErr.Error()))
 		return 0

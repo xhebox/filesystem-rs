@@ -10,6 +10,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -28,6 +31,13 @@ import (
 // another program, which starts the Go runtime itself (see `embed.go`). The
 // linker still wants a `main` in a `main package.
 func main() {}
+
+// The archive is a library inside another process. JuiceFS's CLI-oriented
+// defaults must not write into the host application's stdout or stderr.
+func init() {
+	utils.SetOutput(io.Discard)
+	log.SetOutput(io.Discard)
+}
 
 // formatVolume initializes or updates the volume metadata at `payload` using
 // `metaCli.Init`. When `force` is false and the volume is already formatted, it
@@ -92,8 +102,9 @@ func formatVolume(payload, name, storage, bucket, accessKey, secretKey, sessionT
 
 // buildVFS replicates the essential stage-3 mount flow of upstream
 // cmd/mount.go: meta client, object storage, cached chunk store, VFS.
-func buildVFS(payload string, cacheDir string) (*vfs.VFS, error) {
+func buildVFS(payload string, cacheDir string, readOnly bool) (*vfs.VFS, error) {
 	metaConf := meta.DefaultConf()
+	metaConf.ReadOnly = readOnly
 	metaConf.NoBGJob = true
 	metaConf.MountPoint = "/jfs" // log wording only; nothing is mounted
 

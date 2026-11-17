@@ -1,20 +1,18 @@
 //! Links the Go archive and drives it, which is the whole of what this crate
 //! has to get right.
 //!
-//! Run it after `task juicefs`, which installs the archive it builds into
-//! `target/juicefs`, where the build script looks first — or after a build that
-//! downloaded the archive published for this crate's version.
+//! Cargo normally downloads the archive released for the exact sys dependency.
+//! Maintainers can use `task test-sys` to build and test a local archive.
 //!
 //! ```text
 //! cargo run -p boxfs-juicefs --example smoke [META-URL]
 //! ```
 //!
-//! `JUICEFS_CACHE` moves that cache, here as in the build script.
+//! `JUICEFS_SYS_CACHE` selects the native archive download cache.
 //!
-//! Without a metadata URL it mounts a URL that cannot resolve, and expects the
-//! Go side to say so — which is the interesting part: a failure message is
-//! proof that the runtime started, that the entry call carried the arguments
-//! it needed, and that a `//export`ed function ran.
+//! Without a metadata URL it opens an unformatted SQLite database and expects
+//! the Go side to return an error. This verifies runtime startup and a round
+//! trip through an exported function without requiring a running backend.
 //!
 //! With one, it mounts for real and asks the volume about its root: GETATTR
 //! (ino 1) and STATFS. Between them they cross the same path the device uses
@@ -51,8 +49,19 @@ fn main() -> io::Result<()> {
 	println!("the Go runtime started");
 
 	let Some(meta) = argument else {
-		match boxfs_juicefs::Volume::mount("sqlite3:///nonexistent/volume.db", cache) {
-			Ok(_) => println!("a volume that cannot exist mounted: wrong"),
+		let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("../../target/test-tmp")
+			.join(format!("boxfs-juicefs-smoke-{}", std::process::id()));
+		std::fs::create_dir_all(&dir)?;
+		let meta = format!("sqlite3://{}", dir.join("unformatted.db").display());
+		let result = boxfs_juicefs::Volume::mount(&meta, cache);
+		drop(std::fs::remove_dir_all(&dir));
+		match result {
+			Ok(_) => {
+				return Err(io::Error::other(
+					"a nonexistent volume unexpectedly mounted",
+				));
+			}
 			Err(error) => println!("mount refused, as it should be: {error}"),
 		}
 		return Ok(());
