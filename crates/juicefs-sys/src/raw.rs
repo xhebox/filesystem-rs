@@ -139,6 +139,7 @@ unsafe extern "C" {
 	pub fn juicefs_mount(
 		payload: *mut ::std::os::raw::c_char,
 		cacheDir: *mut ::std::os::raw::c_char,
+		readOnly: ::std::os::raw::c_int,
 		err: *mut usize,
 	) -> usize;
 }

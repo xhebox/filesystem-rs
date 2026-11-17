@@ -225,5 +225,26 @@ fn format_and_mount_isolated_sqlite_volumes() {
 		);
 	}
 
+	{
+		let read_only = boxfs_juicefs::Volume::mount_with_options(
+			&meta_a,
+			&owner_a.join("read-only-cache"),
+			boxfs_juicefs::MountOptions { read_only: true },
+		)
+		.unwrap();
+		assert_eq!(
+			run(Volume::read(&read_only, Path::new("/secret.txt"))),
+			b"alice-only"
+		);
+		assert!(
+			try_run(Volume::write(
+				&read_only,
+				Path::new("/forbidden.txt"),
+				b"must not be written",
+			))
+			.is_err()
+		);
+	}
+
 	drop(fs::remove_dir_all(&dir));
 }

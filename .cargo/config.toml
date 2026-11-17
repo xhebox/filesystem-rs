@@ -6,3 +6,11 @@ target-applies-to-host = true
 
 [target.'cfg(all())']
 rustflags = ["-D", "warnings", "-C", "force-frame-pointers=yes", "-C", "symbol-mangling-version=v0"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-D", "warnings",
+    "-C", "force-frame-pointers=yes",
+    "-C", "symbol-mangling-version=v0",
+    "-C", "link-arg=/ignore:4078",
+]

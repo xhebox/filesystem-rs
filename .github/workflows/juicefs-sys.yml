@@ -1,0 +1,123 @@
+name: JuiceFS Sys Release
+
+on:
+  push:
+    tags: [juicefs-sys-v*]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-26.04
+            target: aarch64-linux-android
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: arduino/setup-task@v3
+        with:
+          repo-token: ${{ github.token }}
+      - uses: actions/setup-go@v6
+        if: runner.os != 'Linux'
+        with:
+          go-version-file: crates/juicefs-sys/binding/go.mod
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - name: Verify tag matches sys version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "boxfs-juicefs-sys") | .version')
+          test "$GITHUB_REF_NAME" = "juicefs-sys-v$version"
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zstd
+      - name: Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\mingw64\bin'
+          choco install winfsp -y --no-progress
+          $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse'
+          if (-not (Test-Path (Join-Path $inc 'fuse_common.h'))) { throw "WinFsp header not found" }
+          $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($inc).ShortPath -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$short"
+      - uses: taiki-e/install-action@nextest
+      - name: Build and test
+        if: matrix.target != 'aarch64-linux-android'
+        run: task test -- --target ${{ matrix.target }}
+      - name: Build Android and check Rust bindings
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          task juicefs TARGET_OS=android
+          cargo clippy --all-targets --locked --target ${{ matrix.target }}
+      - name: Compress
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then brew install zstd; fi
+          zstd -19 target/juicefs-sys/libjuicefs-${{ matrix.target }}.a
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sys-${{ matrix.target }}
+          path: target/juicefs-sys/*.a.zst
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sys-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum libjuicefs-*.a.zst > SHA256SUMS
+      - name: Publish archives
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          generate_release_notes: true
+
+  crates-io:
+    needs: release
+    runs-on: ubuntu-26.04
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          rustflags: ""
+          cache: false
+      - uses: rust-lang/crates-io-auth-action@v1.0.5
+        id: auth
+      - name: Publish sys crate only
+        run: cargo publish -p boxfs-juicefs-sys --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

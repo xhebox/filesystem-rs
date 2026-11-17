@@ -1,13 +1,10 @@
 version: '3'
 
 vars:
-  # The archive's name as `build.rs` spells it. go-task's OS and ARCH are Go's.
-  HOST_RUST_OS: '{{if eq OS "darwin"}}macos{{else}}{{OS}}{{end}}'
   HOST_RUST_ARCH: '{{if eq ARCH "amd64"}}x86_64{{else if eq ARCH "arm64"}}aarch64{{else}}{{ARCH}}{{end}}'
-  # Where `build.rs` looks first for the archive.
-  DIR: '{{.ROOT_DIR}}/target/juicefs'
-  ARCHIVE: '{{.DIR}}/libjuicefs-{{.HOST_RUST_OS}}-{{.HOST_RUST_ARCH}}.a'
-  # Every target a release ships.
+  HOST_RUST_TARGET: '{{.HOST_RUST_ARCH}}-{{if eq OS "linux"}}unknown-linux-musl{{else if eq OS "darwin"}}apple-darwin{{else if eq OS "windows"}}pc-windows-msvc{{end}}'
+  DIR: '{{.ROOT_DIR}}/target/juicefs-sys'
+  ARCHIVE: '{{.DIR}}/libjuicefs-{{.HOST_RUST_TARGET}}.a'
   TARGETS: x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-linux-android
 
 tasks:
@@ -31,26 +28,22 @@ tasks:
       - cargo nextest run --locked {{.CLI_ARGS}}
 
   juicefs:
-    desc: "Install the JuiceFS c-archive that boxfs-juicefs links into target/juicefs"
+    desc: "Install the JuiceFS c-archive into target/juicefs-sys"
     vars:
       TARGET_OS: '{{default OS .TARGET_OS}}'
     cmds:
       # Linux and Android build in the container: Linux for musl's `cc`, Android for the NDK's.
-      - cmd: docker build --build-arg TARGET_OS={{.TARGET_OS}} --target artifact --output 'type=local,dest={{.DIR}}' crates/juicefs
+      - cmd: docker build --build-arg TARGET_OS={{.TARGET_OS}} --target artifact --output 'type=local,dest={{.DIR}}' crates/juicefs-sys
         platforms: [linux]
       # macOS and Windows build on the host, with cgo's own C compiler.
       - cmd: |
           set -eu
           mkdir -p tmp '{{.DIR}}'
-          (cd crates/juicefs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags="-w -X=runtime.godebugDefault=asyncpreemptoff=1" -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
+          (cd crates/juicefs-sys/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags="-w -X=runtime.godebugDefault=asyncpreemptoff=1" -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/libjuicefs.a' .)
           rm -f tmp/libjuicefs.h '{{.ARCHIVE}}'
-          # Strip the constructor that would start the runtime before juicefs
-          # hands it argc/argv, rename Go's entry point to `juicefs_rt0`, merge
-          # the archive's objects with `ld -r`, and localize every non-`juicefs_*`
-          # symbol so the C/cgo internals cannot collide with another archive.
+          # Strip the constructor, rename Go's entry point, and localize symbols.
           if [ '{{OS}}' = darwin ]; then
             entry="__rt0_{{ARCH}}_darwin_lib"
-            # Rustup's llvm-tools puts llvm-objcopy beside the target libraries.
             objcopy=llvm-objcopy
             command -v llvm-objcopy >/dev/null 2>&1 || objcopy="$(rustc --print target-libdir)/../bin/llvm-objcopy"
             "$objcopy" --remove-section=__DATA,__mod_init_func \
@@ -58,8 +51,7 @@ tasks:
               --globalize-symbol=_juicefs_rt0 \
               --redefine-sym "$entry=_juicefs_rt0" \
               tmp/libjuicefs.a
-            # ld-classic asserts on the large relocation addends in Go's objects,
-            # so merge with ld-prime (`-ld_new`) instead.
+            # ld-classic asserts on Go's relocation addends; use ld-prime.
             cc -r -nostdlib -Wl,-ld_new -Wl,-all_load tmp/libjuicefs.a -o tmp/juicefs.o
             "$objcopy" --strip-debug --wildcard --keep-global-symbol='_juicefs_*' tmp/juicefs.o
           else
@@ -67,16 +59,13 @@ tasks:
             objcopy --remove-section=.ctors \
               --redefine-sym "$entry=juicefs_rt0" \
               tmp/libjuicefs.a
-            # MinGW's gcc emits calls to `___chkstk_ms` from `libgcc.a`; pulling
-            # it into `juicefs.o` here resolves it before MSVC's `link.exe` runs.
+            # Resolve MinGW's stack probes before MSVC's link.exe runs.
             libgcc="$(gcc -print-libgcc-file-name)"
             libgcc="${libgcc%"$(printf '\r')"}"
             ld -r -dc --whole-archive tmp/libjuicefs.a \
               --no-whole-archive "$libgcc" \
               -o tmp/juicefs.o
-            # MSVC's link.exe rejects the unwind tables GNU ld joins up here
-            # (LNK1223), and Go walks its own stack from the pclntab anyway, so
-            # drop them instead of teaching the merge to emit them its way.
+            # MSVC rejects the unwind tables GNU ld joins here.
             objcopy --remove-section=.pdata --remove-section=.xdata \
               --strip-debug --wildcard --keep-global-symbol='juicefs_*' tmp/juicefs.o
           fi
@@ -85,11 +74,11 @@ tasks:
         platforms: [darwin, windows]
 
   generate:
-    desc: "Regenerate src/binding.rs from the Go archive's C header (needs bindgen and libclang)"
+    desc: "Regenerate src/raw.rs from the Go archive's C header (needs bindgen and libclang)"
     cmds:
       - cmd: |
           set -eu
           mkdir -p tmp/generate
-          (cd crates/juicefs/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/generate/libjuicefs.a' .)
+          (cd crates/juicefs-sys/binding && CGO_ENABLED=1 go build -buildmode=c-archive -trimpath -ldflags=-w -tags=netgo,osusergo,nogspt -o '{{.ROOT_DIR}}/tmp/generate/libjuicefs.a' .)
           rm -f tmp/generate/libjuicefs.a
-          bindgen tmp/generate/libjuicefs.h --allowlist-function 'juicefs_.*' --allowlist-type 'juicefs_.*' --with-derive-default --impl-debug --rust-target 1.85 --rust-edition 2024 -o crates/juicefs/src/binding.rs
+          bindgen tmp/generate/libjuicefs.h --allowlist-function 'juicefs_.*' --allowlist-type 'juicefs_.*' --with-derive-default --impl-debug --rust-target 1.85 --rust-edition 2024 -o crates/juicefs-sys/src/raw.rs

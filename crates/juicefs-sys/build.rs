@@ -1,13 +1,9 @@
-//! Links the Go c-archive `libjuicefs-{os}-{arch}.a` built for this crate's version.
+//! Links the Go c-archive released for this exact sys crate version.
 //!
 //! The archive is looked for in three places, the first one that has it winning:
-//! `target/juicefs`, where `task juicefs` installs it; `JUICEFS_CACHE`, for
-//! anyone who keeps one; and `OUT_DIR`, where a download from release
-//! `v{version}` lands, checked against `SHA256SUMS`.
-//!
-//! Finding none is a warning, not an error. `cargo check` never links, so it has
-//! no use for the archive; a link that needs it fails on the missing library,
-//! and the warning says what to do about it.
+//! `target/juicefs-sys`, where `task juicefs` installs it; `JUICEFS_SYS_CACHE`,
+//! for anyone who keeps one; and `OUT_DIR`, where a download from release
+//! `juicefs-sys-v{version}` lands, checked against `SHA256SUMS`.
 
 use std::env;
 use std::fs::{self, File};
@@ -20,25 +16,22 @@ use sha2::{Digest, Sha256};
 const BASE_URL: &str = "https://github.com/xhebox/filesystem-rs/releases/download";
 
 fn main() {
-	println!("cargo:rerun-if-env-changed=JUICEFS_CACHE");
+	println!("cargo:rerun-if-env-changed=JUICEFS_SYS_CACHE");
 
-	let target_os = env::var("CARGO_CFG_TARGET_OS").expect("cargo sets CARGO_CFG_TARGET_OS");
-	let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets CARGO_CFG_TARGET_ARCH");
+	let target = env::var("TARGET").expect("cargo sets TARGET");
 	let version = env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
-	let lib = format!("juicefs-{target_os}-{target_arch}");
+	let lib = format!("juicefs-{target}");
 	let name = format!("lib{lib}.a");
 	let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"))
 		.join(format!("v{version}"))
 		.join(&name);
 
-	// Named without the version: this is the workspace's own build, not a release.
-	// It is watched even while absent, so that `task juicefs` makes cargo look again.
 	let manifest =
 		PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
-	let local = manifest.join("../../target/juicefs").join(&name);
+	let local = manifest.join("../../target/juicefs-sys").join(&name);
 	println!("cargo:rerun-if-changed={}", local.display());
 
-	let cached = env::var_os("JUICEFS_CACHE")
+	let cached = env::var_os("JUICEFS_SYS_CACHE")
 		.filter(|dir| !dir.is_empty())
 		.map(|dir| PathBuf::from(dir).join(format!("v{version}")).join(&name));
 	let archive = [Some(local), cached]
@@ -50,18 +43,16 @@ fn main() {
 			Ok(()) => Some(out),
 			Err(reason) => {
 				println!(
-					"cargo:warning=boxfs-juicefs: {reason}; `task juicefs` builds it, and linking needs it"
+					"cargo:warning=boxfs-juicefs-sys: {reason}; `task juicefs` builds it, and linking needs it"
 				);
 				None
 			}
 		});
-	link(archive.as_deref(), &lib, &target_os);
+	link(archive.as_deref(), &lib);
 }
 
-/// Downloads `name`'s compressed form from release `v{version}`, checks its digest
-/// against the one `SHA256SUMS` gives it, and only then unpacks it into `archive`.
 fn fetch(version: &str, name: &str, archive: &Path) -> Result<(), String> {
-	let directory = format!("{BASE_URL}/v{version}");
+	let directory = format!("{BASE_URL}/juicefs-sys-v{version}");
 	let zst = format!("{name}.zst");
 	let sums = get(&format!("{directory}/SHA256SUMS"))?
 		.read_to_string()
@@ -72,8 +63,6 @@ fn fetch(version: &str, name: &str, archive: &Path) -> Result<(), String> {
 	let parent = archive.parent().expect("the archive has a parent");
 	fs::create_dir_all(parent)
 		.map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-	// Both are written beside their final names, so a half-written file is never
-	// what a later build finds.
 	let compressed = parent.join(format!(".{zst}.part"));
 	let part = parent.join(format!(".{name}.part"));
 	let checked = download(&format!("{directory}/{zst}"), &compressed, &expected)
@@ -88,8 +77,6 @@ fn fetch(version: &str, name: &str, archive: &Path) -> Result<(), String> {
 		.map_err(|error| format!("cannot move {} into place: {error}", part.display()))
 }
 
-/// The digest `SHA256SUMS` gives `file`, in `sha256sum`'s format: a digest, two
-/// spaces, a name — with `*` in front of the name for a binary-mode entry.
 fn expected_digest(sums: &str, file: &str) -> Option<String> {
 	sums.lines().find_map(|line| {
 		let mut fields = line.split_whitespace();
@@ -99,7 +86,6 @@ fn expected_digest(sums: &str, file: &str) -> Option<String> {
 	})
 }
 
-/// Opens `url` for reading. The timeout covers the whole transfer.
 fn get(url: &str) -> Result<ureq::Body, String> {
 	let config = ureq::Agent::config_builder()
 		.timeout_global(Some(Duration::from_secs(600)))
@@ -111,8 +97,6 @@ fn get(url: &str) -> Result<ureq::Body, String> {
 	Ok(response.into_body())
 }
 
-/// Streams `url` into `file`, and fails unless the digest of what was written is
-/// `expected`. Hashing on the way means the download is never read twice.
 fn download(url: &str, file: &Path, expected: &str) -> Result<(), String> {
 	let mut body = get(url)?.into_reader();
 	let out = File::create(file).map_err(|error| error.to_string())?;
@@ -134,7 +118,6 @@ fn download(url: &str, file: &Path, expected: &str) -> Result<(), String> {
 	Err(format!("{url} hashes to {actual}, not {expected}"))
 }
 
-/// Decodes the zstd stream in `compressed` into `part`.
 fn unpack(compressed: &Path, part: &Path) -> Result<(), String> {
 	let input = File::open(compressed).map_err(|error| error.to_string())?;
 	let mut decoder = ruzstd::decoding::StreamingDecoder::new(BufReader::new(input))
@@ -145,7 +128,6 @@ fn unpack(compressed: &Path, part: &Path) -> Result<(), String> {
 	out.flush().map_err(|error| error.to_string())
 }
 
-/// Writes through to `file`, hashing every byte that gets written.
 struct Hashing<W> {
 	file: W,
 	hasher: Sha256,
@@ -163,37 +145,23 @@ impl<W: Write> Write for Hashing<W> {
 	}
 }
 
-/// Tells rustc where the archive is, if there is one, and what its C half needs
-/// beyond libc. Without an archive the library is still named, so the link
-/// fails on it rather than on something further off.
-fn link(archive: Option<&Path>, lib: &str, target_os: &str) {
+fn link(archive: Option<&Path>, lib: &str) {
 	if let Some(archive) = archive {
-		// Cargo relinks only for a dependency it was told about.
 		println!("cargo:rerun-if-changed={}", archive.display());
-
 		let dir = archive.parent().expect("the archive has a parent");
 		println!("cargo:rustc-link-search=native={}", dir.display());
 	}
-	// MSVC's linker looks for `{lib}.lib` under `static={lib}`, and nothing else, so
-	// on Windows the archive is named as it is, with `+verbatim`.
-	if target_os == "windows" {
+	let os = env::var("CARGO_CFG_TARGET_OS").expect("cargo sets CARGO_CFG_TARGET_OS");
+	if os == "windows" {
 		println!("cargo:rustc-link-lib=static:+verbatim=lib{lib}.a");
 	} else {
 		println!("cargo:rustc-link-lib=static={lib}");
 	}
-
-	// On musl these are all in libc, and Rust links it statically for musl
-	// targets, so naming them there would only look for files that do not exist.
-	// Android's Bionic is the same story for `pthread`: it lives in libc, and
-	// there is no `libpthread.so` to name. `libdl` and `libm` do exist there.
-	let system: &[&str] = match target_os {
+	let system: &[&str] = match os.as_str() {
 		"linux" if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl") => &[],
 		"linux" => &["pthread", "dl", "m"],
 		"android" => &["dl", "m"],
-		// Go's `crypto/x509` reaches into these on macOS.
 		"macos" => &["framework=Security", "framework=CoreFoundation"],
-		// Go's Windows runtime and cgo's MinGW objects call into these directly;
-		// `legacy_stdio_definitions` supplies the `fprintf` symbol UCRT inline-wrapped.
 		"windows" => &[
 			"advapi32",
 			"legacy_stdio_definitions",
@@ -206,11 +174,7 @@ fn link(archive: Option<&Path>, lib: &str, target_os: &str) {
 	for lib in system {
 		println!("cargo:rustc-link-lib={lib}");
 	}
-
-	// `legacy_stdio_definitions.lib` carries two `.drectve` sections that disagree
-	// about their attributes; link.exe's LNK4078 for it is noise, and the
-	// workspace links with `-D warnings`.
-	if target_os == "windows" {
+	if os == "windows" {
 		println!("cargo:rustc-link-arg=/ignore:4078");
 	}
 }
