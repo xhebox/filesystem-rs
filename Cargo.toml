@@ -13,7 +13,7 @@ categories = ["filesystem"]
 
 [workspace.dependencies]
 api = { package = "boxfs-api", version = "0.1.8", path = "crates/api" }
-asyncband = { version = "0.7.3", features = ["oneshot"] }
+asyncband = { version = "0.8.0", features = ["oneshot"] }
 completion = { package = "completion-async", version = "0.2" }
 fs-core = { package = "rust-fs-core", version = "0.3.15" }
 fs-erofs = { package = "rust-fs-erofs", version = "0.5.0" }
