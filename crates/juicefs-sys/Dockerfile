@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 	&& llvm-objcopy --strip-debug --globalize-symbol=juicefs_rt0 \
 		--wildcard --keep-global-symbol='juicefs_*' \
 		/out/juicefs.o \
-	&& llvm-ar rcs /out/libjuicefs-android-aarch64.a /out/juicefs.o
+	&& llvm-ar rcs /out/libjuicefs-aarch64-linux-android.a /out/juicefs.o
 
 FROM build-${TARGET_OS} AS selected
 
