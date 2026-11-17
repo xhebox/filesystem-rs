@@ -100,7 +100,6 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           overwrite_files: false
-          generate_release_notes: true
 
   crates-io:
     needs: release
