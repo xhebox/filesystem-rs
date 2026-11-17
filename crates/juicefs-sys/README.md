@@ -5,9 +5,9 @@ by filesystem-rs. This is not an upstream JuiceFS C API.
 
 This crate has its own version, independent of the other boxfs crates. Each
 `juicefs-sys-v{version}` GitHub Release contains the corresponding archives
-and `SHA256SUMS`. Cargo downloads `libjuicefs-{target}.a.zst` from that release,
-checks its SHA-256, and links it. Normal builds need neither Go nor a container
-runtime. Release checksums detect corruption; they are not an independent
+and `SHA256SUMS`. Cargo downloads `libjuicefs-{os}-{arch}.a.zst` from that
+release, checks its SHA-256, and links it. Normal builds need neither Go nor a
+container runtime. Release checksums detect corruption; they are not an independent
 signature or protection against replacement of the entire release.
 
 ## Local Development
