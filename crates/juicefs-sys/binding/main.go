@@ -104,9 +104,88 @@ func formatVolume(payload, name, storage, bucket, accessKey, secretKey, sessionT
 }
 
 type mountOptions struct {
-	cacheDir string
-	subdir   string
-	readOnly bool
+	cacheDir          string
+	subdir            string
+	readOnly          bool
+	hideInternal      bool
+	noBGJob           bool
+	ioRetries         int
+	maxDeletes        int
+	openCache         time.Duration
+	openCacheLimit    uint64
+	heartbeat         time.Duration
+	skipDirNlink      int
+	skipDirMtime      time.Duration
+	fastStatfs        bool
+	sortDir           bool
+	bufferSize        uint64
+	maxReadahead      int
+	prefetch          int
+	cacheSize         uint64
+	cacheItems        int64
+	freeSpacePermille uint16
+	cacheFullBlock    bool
+	cacheChecksum     uint8
+	cacheEviction     uint8
+	cacheScanInterval time.Duration
+	cacheExpire       time.Duration
+	writeback         bool
+	maxUploads        int
+	maxDownloads      int
+	uploadLimitBps    int64
+	downloadLimitBps  int64
+	getTimeout        time.Duration
+	putTimeout        time.Duration
+	backupMeta        time.Duration
+	backupSkipTrash   bool
+}
+
+func defaultMountOptions() mountOptions {
+	return mountOptions{
+		noBGJob:           true,
+		ioRetries:         10,
+		maxDeletes:        2,
+		heartbeat:         12 * time.Second,
+		bufferSize:        300 << 20,
+		prefetch:          1,
+		cacheSize:         100 << 20,
+		freeSpacePermille: 100,
+		cacheFullBlock:    true,
+		cacheChecksum:     1, // full
+		cacheEviction:     1, // 2-random
+		maxUploads:        20,
+		maxDownloads:      200,
+		getTimeout:        60 * time.Second,
+		putTimeout:        60 * time.Second,
+	}
+}
+
+func cacheChecksumName(v uint8) string {
+	switch v {
+	case 0:
+		return chunk.CsNone
+	case 1:
+		return chunk.CsFull
+	case 2:
+		return chunk.CsShrink
+	case 3:
+		return chunk.CsExtend
+	default:
+		return chunk.CsFull
+	}
+}
+
+func cacheEvictionName(v uint8) string {
+	switch v {
+	case 0:
+		return chunk.EvictionNone
+	case 1:
+		return chunk.Eviction2Random
+	case 2:
+		return chunk.EvictionLRU
+	default:
+		return chunk.Eviction2Random
+	}
 }
 
 // subdirMeta hides the virtual trash entry for this mount. Setting
@@ -120,61 +199,97 @@ func (m subdirMeta) NewDirHandler(ctx meta.Context, ino meta.Ino, plus bool, ent
 
 // buildVFS replicates the essential stage-3 mount flow of upstream
 // cmd/mount.go: meta client, object storage, cached chunk store, VFS.
-func buildVFS(payload string, opts mountOptions) (*vfs.VFS, error) {
+func buildVFS(payload string, opts mountOptions) (*vfs.VFS, object.ObjectStorage, error) {
 	subdir := path.Clean("/" + opts.subdir)
 	if subdir == "/" {
 		subdir = ""
 	}
 	metaConf := meta.DefaultConf()
 	metaConf.ReadOnly = opts.readOnly
-	metaConf.NoBGJob = true
+	metaConf.NoBGJob = opts.noBGJob
+	metaConf.Retries = opts.ioRetries
+	metaConf.MaxDeletes = opts.maxDeletes
+	metaConf.OpenCache = opts.openCache
+	metaConf.OpenCacheLimit = opts.openCacheLimit
+	metaConf.Heartbeat = opts.heartbeat
+	metaConf.SkipDirNlink = opts.skipDirNlink
+	metaConf.SkipDirMtime = opts.skipDirMtime
+	metaConf.FastStatfs = opts.fastStatfs
+	metaConf.SortDir = opts.sortDir
 	metaConf.MountPoint = "/jfs" // log wording only; nothing is mounted
 
 	metaCli := meta.NewClient(payload, metaConf)
 	format, err := metaCli.Load(true)
 	if err != nil {
-		return nil, fmt.Errorf("load volume format: %w", err)
+		_ = metaCli.Shutdown()
+		return nil, nil, fmt.Errorf("load volume format: %w", err)
 	}
 	if st := metaCli.Chroot(meta.Background(), subdir); st != 0 {
 		_ = metaCli.Shutdown()
-		return nil, fmt.Errorf("chroot %q: %w", subdir, st)
+		return nil, nil, fmt.Errorf("chroot %q: %w", subdir, st)
 	}
 	if err := metaCli.NewSession(true); err != nil {
-		return nil, fmt.Errorf("new session: %w", err)
+		_ = metaCli.Shutdown()
+		return nil, nil, fmt.Errorf("new session: %w", err)
 	}
 
 	if err := format.Decrypt(); err != nil {
-		return nil, fmt.Errorf("format decrypt: %w", err)
+		_ = metaCli.CloseSession()
+		_ = metaCli.Shutdown()
+		return nil, nil, fmt.Errorf("format decrypt: %w", err)
 	}
 	object.UserAgent = "juicefs"
 	blob, err := object.CreateStorage(strings.ToLower(format.Storage), format.Bucket, format.AccessKey, format.SecretKey, format.SessionToken)
 	if err != nil {
-		return nil, fmt.Errorf("object storage: %w", err)
+		_ = metaCli.CloseSession()
+		_ = metaCli.Shutdown()
+		return nil, nil, fmt.Errorf("object storage: %w", err)
 	}
 
 	cacheDir := opts.cacheDir
 	if cacheDir == "" {
 		cacheDir = filepath.Join(os.TempDir(), "juicefs", url.PathEscape(format.Name))
 	}
+	blockSize := int(format.BlockSize) * 1024
+	readahead := opts.maxReadahead
+	if readahead == 0 {
+		readahead = 8 * blockSize
+	}
+	uploadLimit := opts.uploadLimitBps
+	if uploadLimit == 0 {
+		uploadLimit = format.UploadLimit * 1e6 / 8
+	}
+	downloadLimit := opts.downloadLimitBps
+	if downloadLimit == 0 {
+		downloadLimit = format.DownloadLimit * 1e6 / 8
+	}
 	chunkConf := &chunk.Config{
-		BlockSize:      int(format.BlockSize) * 1024,
-		Compress:       format.Compression,
-		HashPrefix:     format.HashPrefix,
-		GetTimeout:     60 * time.Second,
-		PutTimeout:     60 * time.Second,
-		MaxUpload:      20,
-		MaxRetries:     30,
-		Prefetch:       1,
-		BufferSize:     300 << 20,
-		CacheDir:       cacheDir,
-		CacheSize:      100 << 20,
-		CacheMode:      0600,
-		CacheFullBlock: true,
-		CacheChecksum:  "full",
-		CacheEviction:  "2-random",
-		FreeSpace:      0.1,
-		AutoCreate:     true,
-		OSCache:        true,
+		BlockSize:         blockSize,
+		Compress:          format.Compression,
+		HashPrefix:        format.HashPrefix,
+		GetTimeout:        opts.getTimeout,
+		PutTimeout:        opts.putTimeout,
+		MaxUpload:         opts.maxUploads,
+		MaxDownload:       opts.maxDownloads,
+		MaxRetries:        opts.ioRetries,
+		UploadLimit:       uploadLimit,
+		DownloadLimit:     downloadLimit,
+		Prefetch:          opts.prefetch,
+		Readahead:         readahead,
+		BufferSize:        opts.bufferSize,
+		CacheDir:          cacheDir,
+		CacheSize:         opts.cacheSize,
+		CacheItems:        opts.cacheItems,
+		CacheMode:         0600,
+		CacheFullBlock:    opts.cacheFullBlock,
+		CacheChecksum:     cacheChecksumName(opts.cacheChecksum),
+		CacheEviction:     cacheEvictionName(opts.cacheEviction),
+		CacheScanInterval: opts.cacheScanInterval,
+		CacheExpire:       opts.cacheExpire,
+		FreeSpace:         float32(opts.freeSpacePermille) / 1000.0,
+		Writeback:         opts.writeback,
+		AutoCreate:        true,
+		OSCache:           true,
 	}
 	chunkConf.SelfCheck(format.UUID)
 
@@ -188,16 +303,35 @@ func buildVFS(payload string, opts mountOptions) (*vfs.VFS, error) {
 	metaCli.OnMsg(meta.CompactChunk, func(args ...interface{}) error {
 		return vfs.Compact(*chunkConf, store, args[0].([]meta.Slice), args[1].(uint64), args[2].(uint8))
 	})
+	metaCli.OnReload(func(fmt *meta.Format) {
+		if chunkConf.UploadLimit > 0 {
+			fmt.UploadLimit = chunkConf.UploadLimit
+		}
+		if chunkConf.DownloadLimit > 0 {
+			fmt.DownloadLimit = chunkConf.DownloadLimit
+		}
+		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+	})
 
 	vfsConf := &vfs.Config{
-		Meta:    metaConf,
-		Format:  *format,
-		Chunk:   chunkConf,
-		Version: "juicefs",
-		Subdir:  subdir,
+		Meta:            metaConf,
+		Format:          *format,
+		Chunk:           chunkConf,
+		Version:         "juicefs",
+		Subdir:          subdir,
+		HideInternal:    opts.hideInternal,
+		BackupMeta:      opts.backupMeta,
+		BackupSkipTrash: opts.backupSkipTrash,
+	}
+	if !opts.readOnly && !opts.noBGJob && opts.backupMeta > 0 {
+		// Upstream's loop runs for the life of the process and has no stop
+		// channel, so it outlives this volume's session and then keeps failing
+		// its metadata calls. It is off by default, and enabling it is only
+		// worth it for a long-lived volume.
+		go vfs.Backup(metaCli, blob, opts.backupMeta, opts.backupSkipTrash)
 	}
 	if subdir != "" {
 		metaCli = subdirMeta{metaCli}
 	}
-	return vfs.NewVFS(vfsConf, metaCli, store, registry, registry), nil
+	return vfs.NewVFS(vfsConf, metaCli, store, registry, registry), blob, nil
 }

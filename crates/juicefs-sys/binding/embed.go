@@ -67,7 +67,42 @@ typedef struct {
 typedef struct {
 	const char *cache_dir;
 	const char *subdir;
-	int read_only;
+
+	uint64_t open_cache_ns;
+	uint64_t open_cache_limit;
+	uint64_t heartbeat_ns;
+	uint64_t skip_dir_mtime_ns;
+	uint64_t buffer_size;
+	uint64_t max_readahead;
+	uint64_t cache_size;
+	uint64_t cache_items;
+	uint64_t cache_scan_interval_ns;
+	uint64_t cache_expire_ns;
+	uint64_t upload_limit_bps;
+	uint64_t download_limit_bps;
+	uint64_t get_timeout_ns;
+	uint64_t put_timeout_ns;
+	uint64_t backup_meta_ns;
+
+	uint32_t io_retries;
+	uint32_t max_deletes;
+	uint32_t skip_dir_nlink;
+	uint32_t prefetch;
+	uint32_t max_uploads;
+	uint32_t max_downloads;
+
+	uint16_t free_space_permille;
+
+	uint8_t read_only;
+	uint8_t hide_internal;
+	uint8_t no_bgjob;
+	uint8_t fast_statfs;
+	uint8_t sort_dir;
+	uint8_t cache_full_block;
+	uint8_t cache_checksum;
+	uint8_t cache_eviction;
+	uint8_t writeback;
+	uint8_t backup_skip_trash;
 } juicefs_mount_options;
 */
 import "C"
@@ -79,12 +114,14 @@ import (
 	"unsafe"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
 // One mounted volume. The VFS tracks its own inodes and handles.
 type session struct {
-	v *vfs.VFS
+	v    *vfs.VFS
+	blob object.ObjectStorage
 }
 
 // juicefs_format formats or initializes one volume at `payload`. Returns 0 on
@@ -117,20 +154,51 @@ func juicefs_format(payload, name, storage, bucket, accessKey, secretKey, sessio
 //
 //export juicefs_mount
 func juicefs_mount(payload *C.char, options *C.juicefs_mount_options, err *C.uintptr_t) C.uintptr_t {
-	var opts mountOptions
+	opts := defaultMountOptions()
 	if options != nil {
 		opts = mountOptions{
-			cacheDir: C.GoString(options.cache_dir),
-			subdir:   C.GoString(options.subdir),
-			readOnly: options.read_only != 0,
+			cacheDir:          C.GoString(options.cache_dir),
+			subdir:            C.GoString(options.subdir),
+			readOnly:          options.read_only != 0,
+			hideInternal:      options.hide_internal != 0,
+			noBGJob:           options.no_bgjob != 0,
+			ioRetries:         int(options.io_retries),
+			maxDeletes:        int(options.max_deletes),
+			openCache:         time.Duration(options.open_cache_ns),
+			openCacheLimit:    uint64(options.open_cache_limit),
+			heartbeat:         time.Duration(options.heartbeat_ns),
+			skipDirNlink:      int(options.skip_dir_nlink),
+			skipDirMtime:      time.Duration(options.skip_dir_mtime_ns),
+			fastStatfs:        options.fast_statfs != 0,
+			sortDir:           options.sort_dir != 0,
+			bufferSize:        uint64(options.buffer_size),
+			maxReadahead:      int(options.max_readahead),
+			prefetch:          int(options.prefetch),
+			cacheSize:         uint64(options.cache_size),
+			cacheItems:        int64(options.cache_items),
+			freeSpacePermille: uint16(options.free_space_permille),
+			cacheFullBlock:    options.cache_full_block != 0,
+			cacheChecksum:     uint8(options.cache_checksum),
+			cacheEviction:     uint8(options.cache_eviction),
+			cacheScanInterval: time.Duration(options.cache_scan_interval_ns),
+			cacheExpire:       time.Duration(options.cache_expire_ns),
+			writeback:         options.writeback != 0,
+			maxUploads:        int(options.max_uploads),
+			maxDownloads:      int(options.max_downloads),
+			uploadLimitBps:    int64(options.upload_limit_bps),
+			downloadLimitBps:  int64(options.download_limit_bps),
+			getTimeout:        time.Duration(options.get_timeout_ns),
+			putTimeout:        time.Duration(options.put_timeout_ns),
+			backupMeta:        time.Duration(options.backup_meta_ns),
+			backupSkipTrash:   options.backup_skip_trash != 0,
 		}
 	}
-	v, mountErr := buildVFS(C.GoString(payload), opts)
+	v, blob, mountErr := buildVFS(C.GoString(payload), opts)
 	if mountErr != nil {
 		*err = newBytes([]byte(mountErr.Error()))
 		return 0
 	}
-	return C.uintptr_t(cgo.NewHandle(&session{v: v}))
+	return C.uintptr_t(cgo.NewHandle(&session{v: v, blob: blob}))
 }
 
 // juicefs_unmount drops one volume's session. The handle is not reused.
@@ -140,10 +208,15 @@ func juicefs_unmount(h C.uintptr_t) {
 	if h == 0 {
 		return
 	}
-	if s := lookup(h); s != nil && s.v != nil {
-		_ = s.v.FlushAll("")
-		_ = s.v.Meta.CloseSession()
-		_ = s.v.Meta.Shutdown()
+	if s := lookup(h); s != nil {
+		if s.v != nil {
+			_ = s.v.FlushAll("")
+			_ = s.v.Meta.CloseSession()
+			_ = s.v.Meta.Shutdown()
+		}
+		if s.blob != nil {
+			object.Shutdown(s.blob)
+		}
 	}
 	cgo.Handle(h).Delete()
 }
