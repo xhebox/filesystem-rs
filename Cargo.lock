@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "boxfs-api"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "asyncband",
  "libc",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "boxfs-erofs"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "boxfs-api",
  "libc",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "boxfs-localpath"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "boxfs-api",
  "completion-async",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "boxfs-memfs"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "boxfs-api",
  "imbl",
