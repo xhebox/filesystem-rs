@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use api::{
 	Context, CreateArgs, DiffEntry, DiffKind, DirentInfo, Fuse, GetxattrReply, Kstatfs,
@@ -102,16 +103,129 @@ pub struct Volume {
 /// the worker answers on.
 type Job = Box<dyn FnOnce(usize) + Send>;
 
-/// Options applied when mounting a JuiceFS volume.
+/// Eviction policy for the local chunk cache.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheEviction {
+	None = 0,
+	#[default]
+	TwoRandom = 1,
+	Lru = 2,
+}
+
+/// Checksum verification level for cached chunks.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheChecksum {
+	None = 0,
+	#[default]
+	Full = 1,
+	Shrink = 2,
+	Extend = 3,
+}
+
+/// Options applied when mounting a JuiceFS volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MountOptions<'a> {
-	/// Local chunk cache directory. `None` uses the default temporary path.
-	pub cache_dir: Option<&'a Path>,
-	/// Set `meta.Config.ReadOnly` before the metadata client is created.
-	pub read_only: bool,
+	// --- View & mode ---
 	/// Directory within the volume to use as root. `None` mounts the whole
 	/// volume. A missing directory is created only on a writable mount.
 	pub subdir: Option<&'a str>,
+	/// Set `meta.Config.ReadOnly` before the metadata client is created.
+	pub read_only: bool,
+	/// Omit internal nodes (`.stats`, `.config`, `.accesslog`, `.trash`) from
+	/// root directory listings.
+	pub hide_internal: bool,
+
+	// --- Metadata client (meta.Config) ---
+	/// Disable background cleanup jobs and metadata backups. Keep `true` when
+	/// many volumes share one process.
+	pub no_bgjob: bool,
+	pub io_retries: u32,
+	pub max_deletes: u32,
+	pub open_cache: Duration,
+	pub open_cache_limit: u64,
+	pub heartbeat: Duration,
+	pub skip_dir_nlink: u32,
+	pub skip_dir_mtime: Duration,
+	pub fast_statfs: bool,
+	pub sort_dir: bool,
+
+	// --- Memory & read path (chunk.Config) ---
+	/// Total read/write memory buffer in bytes (clamped to at least 32 MiB by JuiceFS).
+	pub buffer_size: u64,
+	/// Maximum readahead per stream in bytes; `0` selects `8 * block_size`.
+	pub max_readahead: u64,
+	pub prefetch: u32,
+
+	// --- Local disk cache (chunk.Config) ---
+	/// Local chunk cache directory. `None` uses the default temporary path.
+	pub cache_dir: Option<&'a Path>,
+	pub cache_size: u64,
+	pub cache_items: u64,
+	/// Minimum free disk ratio in permille (e.g. `100` = 10%).
+	pub free_space_permille: u16,
+	pub cache_full_block: bool,
+	pub cache_checksum: CacheChecksum,
+	pub cache_eviction: CacheEviction,
+	pub cache_scan_interval: Duration,
+	pub cache_expire: Duration,
+	pub writeback: bool,
+
+	// --- Object storage concurrency & timeouts (chunk.Config) ---
+	pub max_uploads: u32,
+	pub max_downloads: u32,
+	pub upload_limit_bps: u64,
+	pub download_limit_bps: u64,
+	pub get_timeout: Duration,
+	pub put_timeout: Duration,
+
+	// --- Metadata backup (vfs.Config) ---
+	/// Periodic metadata backup interval; `Duration::ZERO` disables backups.
+	/// Ignored when `read_only` or `no_bgjob` is `true`.
+	pub backup_meta: Duration,
+	pub backup_skip_trash: bool,
+}
+
+impl Default for MountOptions<'_> {
+	fn default() -> Self {
+		Self {
+			subdir: None,
+			read_only: false,
+			hide_internal: false,
+			no_bgjob: true,
+			io_retries: 10,
+			max_deletes: 2,
+			open_cache: Duration::ZERO,
+			open_cache_limit: 0,
+			heartbeat: Duration::from_secs(12),
+			skip_dir_nlink: 0,
+			skip_dir_mtime: Duration::ZERO,
+			fast_statfs: false,
+			sort_dir: false,
+			buffer_size: 300 << 20,
+			max_readahead: 0,
+			prefetch: 1,
+			cache_dir: None,
+			cache_size: 100 << 20,
+			cache_items: 0,
+			free_space_permille: 100,
+			cache_full_block: true,
+			cache_checksum: CacheChecksum::Full,
+			cache_eviction: CacheEviction::TwoRandom,
+			cache_scan_interval: Duration::ZERO,
+			cache_expire: Duration::ZERO,
+			writeback: false,
+			max_uploads: 20,
+			max_downloads: 200,
+			upload_limit_bps: 0,
+			download_limit_bps: 0,
+			get_timeout: Duration::from_secs(60),
+			put_timeout: Duration::from_secs(60),
+			backup_meta: Duration::ZERO,
+			backup_skip_trash: false,
+		}
+	}
 }
 
 impl Volume {
@@ -189,10 +303,42 @@ impl Volume {
 		let subdir = options.subdir.map(CString::new).transpose().map_err(|_| {
 			io::Error::new(io::ErrorKind::InvalidInput, "the subdirectory has a NUL")
 		})?;
+		let duration_ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
 		let mut options = binding::juicefs_mount_options {
 			cache_dir: cache.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
 			subdir: subdir.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-			read_only: c_int::from(options.read_only),
+			open_cache_ns: duration_ns(options.open_cache),
+			open_cache_limit: options.open_cache_limit,
+			heartbeat_ns: duration_ns(options.heartbeat),
+			skip_dir_mtime_ns: duration_ns(options.skip_dir_mtime),
+			buffer_size: options.buffer_size,
+			max_readahead: options.max_readahead,
+			cache_size: options.cache_size,
+			cache_items: options.cache_items,
+			cache_scan_interval_ns: duration_ns(options.cache_scan_interval),
+			cache_expire_ns: duration_ns(options.cache_expire),
+			upload_limit_bps: options.upload_limit_bps,
+			download_limit_bps: options.download_limit_bps,
+			get_timeout_ns: duration_ns(options.get_timeout),
+			put_timeout_ns: duration_ns(options.put_timeout),
+			backup_meta_ns: duration_ns(options.backup_meta),
+			io_retries: options.io_retries,
+			max_deletes: options.max_deletes,
+			skip_dir_nlink: options.skip_dir_nlink,
+			prefetch: options.prefetch,
+			max_uploads: options.max_uploads,
+			max_downloads: options.max_downloads,
+			free_space_permille: options.free_space_permille,
+			read_only: u8::from(options.read_only),
+			hide_internal: u8::from(options.hide_internal),
+			no_bgjob: u8::from(options.no_bgjob),
+			fast_statfs: u8::from(options.fast_statfs),
+			sort_dir: u8::from(options.sort_dir),
+			cache_full_block: u8::from(options.cache_full_block),
+			cache_checksum: options.cache_checksum as u8,
+			cache_eviction: options.cache_eviction as u8,
+			writeback: u8::from(options.writeback),
+			backup_skip_trash: u8::from(options.backup_skip_trash),
 		};
 		let mut error = 0usize;
 		// SAFETY: options and its NUL-terminated strings outlive the call,

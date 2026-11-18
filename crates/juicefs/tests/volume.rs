@@ -305,3 +305,111 @@ fn format_and_mount_isolated_sqlite_volumes() {
 	drop((read_only, a, b, root));
 	drop(fs::remove_dir_all(&dir));
 }
+
+/// Root listing names, as raw bytes, for one directory handle's whole read.
+fn root_names(volume: &boxfs_juicefs::Volume) -> Vec<Vec<u8>> {
+	let ctx = boxfs_juicefs::Ctx::default();
+	let fh = run(volume.opendir(ctx, 1, 0));
+	let mut names = Vec::new();
+	loop {
+		let offset = names.len();
+		let (entries, _) = run(volume.readdir(ctx, 1, fh, offset as u64, 4096, true));
+		if entries.is_empty() {
+			break;
+		}
+		names.extend(entries.into_iter().map(|entry| entry.name));
+	}
+	run(volume.releasedir(ctx, 1, fh));
+	names
+}
+
+#[test]
+fn hide_internal_and_cache_options() {
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../target/test-tmp")
+		.join(format!("boxfs-juicefs-options-test-{}", std::process::id()));
+	drop(fs::remove_dir_all(&dir));
+	let chunks = dir.join("chunks");
+	fs::create_dir_all(&chunks).unwrap();
+	let meta = format!("sqlite3://{}", dir.join("meta.db").display());
+	boxfs_juicefs::Volume::format(
+		&meta,
+		&boxfs_juicefs::Format {
+			name: "options".into(),
+			storage: "file".into(),
+			bucket: chunks.display().to_string(),
+			..Default::default()
+		},
+	)
+	.unwrap();
+
+	let cache = dir.join("cache");
+	let hidden = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(&cache),
+			hide_internal: true,
+			..Default::default()
+		},
+	)
+	.unwrap();
+	let names = root_names(&hidden);
+	assert!(names.iter().any(|name| name == b"."), "{names:?}");
+	for internal in [b".config".as_slice(), b".stats", b".accesslog", b".trash"] {
+		assert!(
+			!names.iter().any(|name| name == internal),
+			"{internal:?} must not be listed: {names:?}"
+		);
+	}
+	// Hiding is a listing policy, not a permission: the node is still reachable.
+	let ctx = boxfs_juicefs::Ctx::default();
+	assert!(try_run(hidden.lookup(ctx, 1, c".config")).is_ok());
+
+	// The same volume mounted without the flag still shows them.
+	let shown = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(&cache),
+			..Default::default()
+		},
+	)
+	.unwrap();
+	let names = root_names(&shown);
+	for internal in [b".config".as_slice(), b".stats", b".accesslog", b".trash"] {
+		assert!(
+			names.iter().any(|name| name == internal),
+			"{internal:?} must be listed: {names:?}"
+		);
+	}
+
+	// Memory-only cache with non-default eviction and checksum, plus a custom
+	// readahead and writeback, exercises the remaining option plumbing.
+	let tuned = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(Path::new("memory")),
+			cache_size: 64 << 20,
+			cache_items: 1024,
+			cache_eviction: boxfs_juicefs::CacheEviction::Lru,
+			cache_checksum: boxfs_juicefs::CacheChecksum::Extend,
+			max_readahead: 16 << 20,
+			prefetch: 2,
+			writeback: true,
+			buffer_size: 64 << 20,
+			max_uploads: 8,
+			max_downloads: 16,
+			io_retries: 3,
+			get_timeout: std::time::Duration::from_secs(30),
+			put_timeout: std::time::Duration::from_secs(30),
+			free_space_permille: 0,
+			..Default::default()
+		},
+	)
+	.unwrap();
+	let payload = vec![7u8; 3 << 20];
+	run(Volume::write(&tuned, Path::new("/payload"), &payload));
+	assert_eq!(run(Volume::read(&tuned, Path::new("/payload"))), payload);
+
+	drop((tuned, shown, hidden));
+	drop(fs::remove_dir_all(&dir));
+}
