@@ -63,6 +63,12 @@ typedef struct {
 	uint64_t files;
 	uint64_t favail;
 } juicefs_statvfs;
+
+typedef struct {
+	const char *cache_dir;
+	const char *subdir;
+	int read_only;
+} juicefs_mount_options;
 */
 import "C"
 
@@ -106,11 +112,20 @@ func juicefs_format(payload, name, storage, bucket, accessKey, secretKey, sessio
 
 // juicefs_mount mounts one volume and returns its handle. A handle of 0 means
 // failure, and `err` is then a bytes handle holding the message, which the
-// caller reads with the `juicefs_bytes_*` functions and releases.
+// caller reads with the `juicefs_bytes_*` functions and releases. Options and
+// their strings are borrowed only for the call; NULL selects defaults.
 //
 //export juicefs_mount
-func juicefs_mount(payload, cacheDir *C.char, readOnly C.int, err *C.uintptr_t) C.uintptr_t {
-	v, mountErr := buildVFS(C.GoString(payload), C.GoString(cacheDir), readOnly != 0)
+func juicefs_mount(payload *C.char, options *C.juicefs_mount_options, err *C.uintptr_t) C.uintptr_t {
+	var opts mountOptions
+	if options != nil {
+		opts = mountOptions{
+			cacheDir: C.GoString(options.cache_dir),
+			subdir:   C.GoString(options.subdir),
+			readOnly: options.read_only != 0,
+		}
+	}
+	v, mountErr := buildVFS(C.GoString(payload), opts)
 	if mountErr != nil {
 		*err = newBytes([]byte(mountErr.Error()))
 		return 0
@@ -217,7 +232,18 @@ func entryReply(e *meta.Entry, out *C.juicefs_entry) C.int {
 //export juicefs_lookup
 func juicefs_lookup(h C.uintptr_t, ctx *C.juicefs_ctx, parent C.uint64_t, name *C.char, out *C.juicefs_entry) C.int {
 	return guard(h, func(s *session) C.int {
-		e, err := s.v.Lookup(s.context(ctx), meta.Ino(parent), C.GoString(name))
+		c, ino, n := s.context(ctx), meta.Ino(parent), C.GoString(name)
+		if s.v.Conf.Subdir != "" && ino == meta.RootInode && n == meta.TrashName {
+			// Bypass the virtual trash entry; a real file with this name can
+			// still exist in the mounted directory.
+			var e meta.Entry
+			e.Attr = new(meta.Attr)
+			if err := s.v.Meta.Lookup(c, ino, n, &e.Inode, e.Attr, true); err != 0 {
+				return C.int(err)
+			}
+			return entryReply(&e, out)
+		}
+		e, err := s.v.Lookup(c, ino, n)
 		if err != 0 {
 			return C.int(err)
 		}

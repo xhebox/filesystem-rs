@@ -135,11 +135,51 @@ const _: () = {
 	["Offset of field: juicefs_statvfs::favail"]
 		[::std::mem::offset_of!(juicefs_statvfs, favail) - 24usize];
 };
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct juicefs_mount_options {
+	pub cache_dir: *const ::std::os::raw::c_char,
+	pub subdir: *const ::std::os::raw::c_char,
+	pub read_only: ::std::os::raw::c_int,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+	["Size of juicefs_mount_options"][::std::mem::size_of::<juicefs_mount_options>() - 24usize];
+	["Alignment of juicefs_mount_options"]
+		[::std::mem::align_of::<juicefs_mount_options>() - 8usize];
+	["Offset of field: juicefs_mount_options::cache_dir"]
+		[::std::mem::offset_of!(juicefs_mount_options, cache_dir) - 0usize];
+	["Offset of field: juicefs_mount_options::subdir"]
+		[::std::mem::offset_of!(juicefs_mount_options, subdir) - 8usize];
+	["Offset of field: juicefs_mount_options::read_only"]
+		[::std::mem::offset_of!(juicefs_mount_options, read_only) - 16usize];
+};
+impl Default for juicefs_mount_options {
+	fn default() -> Self {
+		let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+		unsafe {
+			::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+			s.assume_init()
+		}
+	}
+}
+unsafe extern "C" {
+	pub fn juicefs_format(
+		payload: *mut ::std::os::raw::c_char,
+		name: *mut ::std::os::raw::c_char,
+		storage: *mut ::std::os::raw::c_char,
+		bucket: *mut ::std::os::raw::c_char,
+		accessKey: *mut ::std::os::raw::c_char,
+		secretKey: *mut ::std::os::raw::c_char,
+		sessionToken: *mut ::std::os::raw::c_char,
+		force: ::std::os::raw::c_int,
+		err: *mut usize,
+	) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
 	pub fn juicefs_mount(
 		payload: *mut ::std::os::raw::c_char,
-		cacheDir: *mut ::std::os::raw::c_char,
-		readOnly: ::std::os::raw::c_int,
+		options: *mut juicefs_mount_options,
 		err: *mut usize,
 	) -> usize;
 }
@@ -548,19 +588,6 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
 	pub fn juicefs_dirents_free(list: usize);
-}
-unsafe extern "C" {
-	pub fn juicefs_format(
-		payload: *mut ::std::os::raw::c_char,
-		name: *mut ::std::os::raw::c_char,
-		storage: *mut ::std::os::raw::c_char,
-		bucket: *mut ::std::os::raw::c_char,
-		accessKey: *mut ::std::os::raw::c_char,
-		secretKey: *mut ::std::os::raw::c_char,
-		sessionToken: *mut ::std::os::raw::c_char,
-		force: ::std::os::raw::c_int,
-		err: *mut usize,
-	) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
 	pub fn juicefs_update_readdir_offset(

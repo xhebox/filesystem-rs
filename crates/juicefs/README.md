@@ -6,7 +6,7 @@ JuiceFS volume back-end for [`filesystem-rs`](https://github.com/xhebox/filesyst
 
 `Volume` mounts a JuiceFS volume in-process without a helper daemon or FUSE wire serialization across the boundary:
 
-- `Volume::mount(meta_url, cache_dir)` initializes the embedded Go runtime with a read-write metadata client. `Volume::mount_with_options` additionally accepts `MountOptions { read_only: true }`, which sets JuiceFS `meta.Config.ReadOnly` before the client is created.
+- `Volume::mount(meta_url, MountOptions::default())` mounts the whole volume read-write with the default local cache directory. Pass `MountOptions { cache_dir: Some(cache_dir), read_only: true, subdir: Some("/data") }` to choose a cache directory and mount `/data` as the root of a read-only volume. A writable mount creates a missing subdirectory; a read-only mount requires it to exist.
 - JuiceFS and Go standard-library logs are discarded by default so the embedded archive never writes into the host application's stdout or stderr. Operation failures are returned through the Rust API.
 - Blocking calls into Go (object storage and metadata engine I/O) run on the session's plain worker threads and return via oneshot channels, keeping async device reactors unblocked and preventing Go threads from inheriting per-thread seccomp filters.
 - Dropping `Volume` closes the worker queues and unmounts the Go session.

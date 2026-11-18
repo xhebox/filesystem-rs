@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
 
 use api::{DiffKind, Snapshot, Volume};
+use boxfs_juicefs::MountOptions;
 
 /// Polls a future while the volume's worker threads perform I/O.
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -48,7 +49,14 @@ fn walk_read_range_and_diff() {
 			Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp/juicefs-cache")
 		});
 	fs::create_dir_all(&cache).unwrap();
-	let volume = boxfs_juicefs::Volume::mount(&meta, &cache).unwrap();
+	let volume = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(&cache),
+			..Default::default()
+		},
+	)
+	.unwrap();
 	let root = format!("/juicefs-contract-{}", std::process::id());
 	let root = Path::new(&root);
 
@@ -196,9 +204,19 @@ fn format_and_mount_isolated_sqlite_volumes() {
 	)
 	.unwrap();
 
+	let cache_a = owner_a.join("cache");
+	let cache_b = owner_b.join("cache");
+	let options_a = MountOptions {
+		cache_dir: Some(&cache_a),
+		..Default::default()
+	};
+	let options_b = MountOptions {
+		cache_dir: Some(&cache_b),
+		..Default::default()
+	};
 	{
-		let vol_a = boxfs_juicefs::Volume::mount(&meta_a, &owner_a.join("cache")).unwrap();
-		let vol_b = boxfs_juicefs::Volume::mount(&meta_b, &owner_b.join("cache")).unwrap();
+		let vol_a = boxfs_juicefs::Volume::mount(&meta_a, options_a).unwrap();
+		let vol_b = boxfs_juicefs::Volume::mount(&meta_b, options_b).unwrap();
 		run(Volume::write(
 			&vol_a,
 			Path::new("/secret.txt"),
@@ -218,7 +236,7 @@ fn format_and_mount_isolated_sqlite_volumes() {
 
 	// Re-mount vol_a after drop to verify native persistence.
 	{
-		let vol_a = boxfs_juicefs::Volume::mount(&meta_a, &owner_a.join("cache")).unwrap();
+		let vol_a = boxfs_juicefs::Volume::mount(&meta_a, options_a).unwrap();
 		assert_eq!(
 			run(Volume::read(&vol_a, Path::new("/secret.txt"))),
 			b"alice-only"
@@ -226,10 +244,13 @@ fn format_and_mount_isolated_sqlite_volumes() {
 	}
 
 	{
-		let read_only = boxfs_juicefs::Volume::mount_with_options(
+		let read_only = boxfs_juicefs::Volume::mount(
 			&meta_a,
-			&owner_a.join("read-only-cache"),
-			boxfs_juicefs::MountOptions { read_only: true },
+			MountOptions {
+				cache_dir: Some(&owner_a.join("read-only-cache")),
+				read_only: true,
+				..Default::default()
+			},
 		)
 		.unwrap();
 		assert_eq!(
@@ -246,5 +267,41 @@ fn format_and_mount_isolated_sqlite_volumes() {
 		);
 	}
 
+	// Keep both subdirectory mounts alive while opening a whole-volume mount.
+	let mount_subdir = |subdir, read_only| {
+		boxfs_juicefs::Volume::mount(
+			&meta_a,
+			MountOptions {
+				read_only,
+				subdir: Some(subdir),
+				..options_a
+			},
+		)
+	};
+	assert!(mount_subdir("/missing", true).is_err());
+	let a = mount_subdir("/a", false).unwrap();
+	let b = mount_subdir("/b", false).unwrap();
+	let root = boxfs_juicefs::Volume::mount(&meta_a, options_a).unwrap();
+	run(Volume::write(&a, Path::new("/marker"), b"a"));
+	run(Volume::write(&b, Path::new("/marker"), b"b"));
+	assert_eq!(run(Volume::read(&root, Path::new("/a/marker"))), b"a");
+	assert_eq!(run(Volume::read(&root, Path::new("/b/marker"))), b"b");
+	assert!(try_run(Volume::read(&a, Path::new("/secret.txt"))).is_err());
+	let read_only = mount_subdir("/a", true).unwrap();
+	assert_eq!(run(Volume::read(&read_only, Path::new("/marker"))), b"a");
+	let ctx = boxfs_juicefs::Ctx::default();
+	assert!(try_run(a.lookup(ctx, 1, c".trash")).is_err());
+	assert!(try_run(root.lookup(ctx, 1, c".trash")).is_ok());
+	for (volume, expect_trash) in [(&a, false), (&b, false), (&root, true)] {
+		let fh = run(volume.opendir(ctx, 1, 0));
+		let (entries, _) = run(volume.readdir(ctx, 1, fh, 0, 4096, true));
+		assert!(entries.iter().any(|entry| entry.name == b".config"));
+		assert_eq!(
+			entries.iter().any(|entry| entry.name == b".trash"),
+			expect_trash
+		);
+		run(volume.releasedir(ctx, 1, fh));
+	}
+	drop((read_only, a, b, root));
 	drop(fs::remove_dir_all(&dir));
 }
