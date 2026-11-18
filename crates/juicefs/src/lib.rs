@@ -102,11 +102,16 @@ pub struct Volume {
 /// the worker answers on.
 type Job = Box<dyn FnOnce(usize) + Send>;
 
-/// Options applied while constructing a JuiceFS metadata client.
+/// Options applied when mounting a JuiceFS volume.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MountOptions {
+pub struct MountOptions<'a> {
+	/// Local chunk cache directory. `None` uses the default temporary path.
+	pub cache_dir: Option<&'a Path>,
 	/// Set `meta.Config.ReadOnly` before the metadata client is created.
 	pub read_only: bool,
+	/// Directory within the volume to use as root. `None` mounts the whole
+	/// volume. A missing directory is created only on a writable mount.
+	pub subdir: Option<&'a str>,
 }
 
 impl Volume {
@@ -163,39 +168,37 @@ impl Volume {
 		Ok(())
 	}
 
-	/// Mounts the volume with the default read-write metadata client.
-	pub fn mount(meta_url: &str, cache_dir: &Path) -> io::Result<Volume> {
-		Self::mount_with_options(meta_url, cache_dir, MountOptions::default())
-	}
-
-	/// Mounts the volume `meta_url` names, caching chunks under `cache_dir`.
+	/// Mounts the volume `meta_url` names with the given options.
+	/// The default options mount the whole volume read-write.
 	///
 	/// Starts the Go runtime if this is the process's first volume, and the
 	/// pool with it, so it must run on a thread no device filter has reached
 	/// and at a point [`start_runtime`] describes — see this module's
 	/// documentation.
-	pub fn mount_with_options(
-		meta_url: &str,
-		cache_dir: &Path,
-		options: MountOptions,
-	) -> io::Result<Volume> {
+	pub fn mount(meta_url: &str, options: MountOptions<'_>) -> io::Result<Volume> {
 		start_runtime();
 		let payload = CString::new(meta_url).map_err(|_| {
 			io::Error::new(io::ErrorKind::InvalidInput, "the metadata URL has a NUL")
 		})?;
-		let cache = CString::new(cache_dir.as_os_str().as_encoded_bytes())
+		let cache = options
+			.cache_dir
+			.map(|dir| CString::new(dir.as_os_str().as_encoded_bytes()))
+			.transpose()
 			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the cache path has a NUL"))?;
 
+		let subdir = options.subdir.map(CString::new).transpose().map_err(|_| {
+			io::Error::new(io::ErrorKind::InvalidInput, "the subdirectory has a NUL")
+		})?;
+		let mut options = binding::juicefs_mount_options {
+			cache_dir: cache.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+			subdir: subdir.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+			read_only: c_int::from(options.read_only),
+		};
 		let mut error = 0usize;
-		// SAFETY: both arguments are valid NUL-terminated strings for the
-		// duration of the call, and `error` is a valid place to write one.
+		// SAFETY: options and its NUL-terminated strings outlive the call,
+		// and `error` is a valid out-pointer.
 		let handle = unsafe {
-			binding::juicefs_mount(
-				payload.as_ptr().cast_mut(),
-				cache.as_ptr().cast_mut(),
-				c_int::from(options.read_only),
-				&mut error,
-			)
+			binding::juicefs_mount(payload.as_ptr().cast_mut(), &mut options, &mut error)
 		};
 		if handle == 0 {
 			return Err(mount_error(error));

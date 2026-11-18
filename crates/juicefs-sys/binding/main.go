@@ -14,8 +14,11 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -100,11 +103,30 @@ func formatVolume(payload, name, storage, bucket, accessKey, secretKey, sessionT
 	return nil
 }
 
+type mountOptions struct {
+	cacheDir string
+	subdir   string
+	readOnly bool
+}
+
+// subdirMeta hides the virtual trash entry for this mount. Setting
+// meta.Config.Subdir in this version would mutate vfs's global internal nodes.
+type subdirMeta struct{ meta.Meta }
+
+func (m subdirMeta) NewDirHandler(ctx meta.Context, ino meta.Ino, plus bool, entries []*meta.Entry) (meta.DirHandler, syscall.Errno) {
+	entries = slices.DeleteFunc(entries, func(e *meta.Entry) bool { return e.Inode == meta.TrashInode })
+	return m.Meta.NewDirHandler(ctx, ino, plus, entries)
+}
+
 // buildVFS replicates the essential stage-3 mount flow of upstream
 // cmd/mount.go: meta client, object storage, cached chunk store, VFS.
-func buildVFS(payload string, cacheDir string, readOnly bool) (*vfs.VFS, error) {
+func buildVFS(payload string, opts mountOptions) (*vfs.VFS, error) {
+	subdir := path.Clean("/" + opts.subdir)
+	if subdir == "/" {
+		subdir = ""
+	}
 	metaConf := meta.DefaultConf()
-	metaConf.ReadOnly = readOnly
+	metaConf.ReadOnly = opts.readOnly
 	metaConf.NoBGJob = true
 	metaConf.MountPoint = "/jfs" // log wording only; nothing is mounted
 
@@ -113,8 +135,9 @@ func buildVFS(payload string, cacheDir string, readOnly bool) (*vfs.VFS, error) 
 	if err != nil {
 		return nil, fmt.Errorf("load volume format: %w", err)
 	}
-	if st := metaCli.Chroot(meta.Background(), ""); st != 0 {
-		return nil, fmt.Errorf("chroot: %d", st)
+	if st := metaCli.Chroot(meta.Background(), subdir); st != 0 {
+		_ = metaCli.Shutdown()
+		return nil, fmt.Errorf("chroot %q: %w", subdir, st)
 	}
 	if err := metaCli.NewSession(true); err != nil {
 		return nil, fmt.Errorf("new session: %w", err)
@@ -129,6 +152,7 @@ func buildVFS(payload string, cacheDir string, readOnly bool) (*vfs.VFS, error) 
 		return nil, fmt.Errorf("object storage: %w", err)
 	}
 
+	cacheDir := opts.cacheDir
 	if cacheDir == "" {
 		cacheDir = filepath.Join(os.TempDir(), "juicefs", url.PathEscape(format.Name))
 	}
@@ -170,6 +194,10 @@ func buildVFS(payload string, cacheDir string, readOnly bool) (*vfs.VFS, error) 
 		Format:  *format,
 		Chunk:   chunkConf,
 		Version: "juicefs",
+		Subdir:  subdir,
+	}
+	if subdir != "" {
+		metaCli = subdirMeta{metaCli}
 	}
 	return vfs.NewVFS(vfsConf, metaCli, store, registry, registry), nil
 }

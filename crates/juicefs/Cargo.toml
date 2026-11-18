@@ -6,12 +6,12 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 name = "boxfs-juicefs"
-version.workspace = true
+version = "0.3.0"
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-juicefs-sys = { package = "boxfs-juicefs-sys", path = "../juicefs-sys", version = "=0.1.1" }
+juicefs-sys = { package = "boxfs-juicefs-sys", path = "../juicefs-sys", version = "=0.1.2" }
 api = { workspace = true }
 asyncband = { workspace = true }
 libc = { workspace = true }

@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "boxfs-juicefs"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "asyncband",
  "boxfs-api",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "boxfs-juicefs-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ruzstd 0.9.1",
  "sha2",

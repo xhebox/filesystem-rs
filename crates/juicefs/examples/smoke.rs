@@ -43,7 +43,10 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn main() -> io::Result<()> {
 	let argument = std::env::args().nth(1);
-	let cache = std::path::Path::new("/tmp/juicefs-smoke");
+	let options = boxfs_juicefs::MountOptions {
+		cache_dir: Some(std::path::Path::new("/tmp/juicefs-smoke")),
+		..Default::default()
+	};
 
 	boxfs_juicefs::start_runtime();
 	println!("the Go runtime started");
@@ -54,7 +57,7 @@ fn main() -> io::Result<()> {
 			.join(format!("boxfs-juicefs-smoke-{}", std::process::id()));
 		std::fs::create_dir_all(&dir)?;
 		let meta = format!("sqlite3://{}", dir.join("unformatted.db").display());
-		let result = boxfs_juicefs::Volume::mount(&meta, cache);
+		let result = boxfs_juicefs::Volume::mount(&meta, options);
 		drop(std::fs::remove_dir_all(&dir));
 		match result {
 			Ok(_) => {
@@ -67,7 +70,7 @@ fn main() -> io::Result<()> {
 		return Ok(());
 	};
 
-	let volume = boxfs_juicefs::Volume::mount(&meta, cache)?;
+	let volume = boxfs_juicefs::Volume::mount(&meta, options)?;
 	println!("mounted");
 
 	let ctx = boxfs_juicefs::Ctx::default();
