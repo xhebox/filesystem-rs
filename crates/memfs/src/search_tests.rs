@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::tests::block_on;
 use api::{
-	Attr, ContentIndex, IndexOptions, Search, SearchIndex, SearchQuery, Snapshot, Volume,
-	VolumeHook, WalkEntry,
+	Attr, ContentIndex, IndexOptions, Search, SearchIndex, SearchQuery, Volume, VolumeHook,
+	WalkEntry,
 };
 
 use crate::MemFs;
@@ -199,20 +199,32 @@ fn custom_hook_persists_loads_and_receives_live_mutations() {
 		fs.search_index().unwrap().notify_reset();
 		fs.indexed_walk(root).await.unwrap();
 		assert_eq!(hook.loads.load(Ordering::Relaxed), 1);
-		let snapshot = fs.snapshot().await.unwrap();
+		Volume::clone_tree(&fs, Path::new("/src"), Path::new("/snap"))
+			.await
+			.unwrap();
 		Volume::rename(&fs, Path::new("/src"), Path::new("/moved"))
 			.await
 			.unwrap();
 		assert_eq!(hook.renames.load(Ordering::Relaxed), 1);
 		assert_eq!(hook.writes.load(Ordering::Relaxed), 1);
 		assert_eq!(
-			fs.search(root, &SearchQuery::new("Needle")).await.unwrap()[0].path,
+			fs.search(Path::new("/moved"), &SearchQuery::new("Needle"))
+				.await
+				.unwrap()[0]
+				.path,
 			Path::new("/moved/sub/file")
 		);
 		Volume::remove_all(&fs, Path::new("/moved")).await.unwrap();
-		assert!(fs.indexed_walk(root).await.unwrap().is_empty());
+		assert!(
+			fs.indexed_walk(Path::new("/moved"))
+				.await
+				.unwrap()
+				.is_empty()
+		);
 		assert_eq!(hook.removes.load(Ordering::Relaxed), 1);
-		fs.restore(&snapshot).await.unwrap();
+		Volume::rename(&fs, Path::new("/snap"), Path::new("/src"))
+			.await
+			.unwrap();
 		assert_eq!(
 			fs.search(root, &SearchQuery::new("Needle"))
 				.await

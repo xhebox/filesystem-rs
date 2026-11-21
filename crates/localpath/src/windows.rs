@@ -1,7 +1,7 @@
 //! Windows confined passthrough filesystem and its FUSE protocol surface.
 //!
-//! [`PassthroughFs`] implements [`api::Fuse`], [`api::Volume`], and
-//! [`api::Snapshot`] over a preopened root directory handle.
+//! [`PassthroughFs`] implements [`api::Fuse`] and [`api::Volume`] over a
+//! preopened root directory handle.
 //!
 //! Confinement is achieved by construction and identity verification:
 //! - Every component is validated (`validate_component`) to reject `.`, `..`,
@@ -23,7 +23,6 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::{
 	FATTR_ATIME, FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
@@ -31,9 +30,8 @@ use crate::abi::{
 };
 use crate::span::{engine_io, read_exact, read_into, write_into};
 use api::{
-	Attr, Context, CreateArgs, DiffEntry, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply,
-	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
-	diff_volumes,
+	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
+	ListxattrReply, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
 };
 use api::{IndexOptions, Search, SearchIndex};
 
@@ -132,31 +130,8 @@ enum Resource {
 	},
 }
 
-struct SnapshotPool {
-	dir: PathBuf,
-	next_id: AtomicU64,
-}
-
-impl SnapshotPool {
-	fn new(dir: File) -> io::Result<Self> {
-		if !dir.metadata()?.is_dir() {
-			return Err(errno(libc::ENOTDIR));
-		}
-		let path = handle_path(&dir)?;
-		Ok(Self {
-			dir: path,
-			next_id: AtomicU64::new(1),
-		})
-	}
-
-	fn allocate_id(&self) -> u64 {
-		self.next_id.fetch_add(1, Ordering::Relaxed)
-	}
-}
-
 pub(crate) struct FsState {
 	read_only: bool,
-	snapshots: Option<Arc<SnapshotPool>>,
 	nodes: HashMap<Inode, Node>,
 	identities: HashMap<(u64, u64), Inode>,
 	next_inode: Inode,
@@ -189,16 +164,7 @@ impl PassthroughFs {
 	}
 
 	pub fn new(root: File, read_only: bool) -> io::Result<Self> {
-		let state = FsState::new(root, None, read_only)?;
-		Ok(Self {
-			index: None,
-			state: RefCell::new(state),
-		})
-	}
-
-	pub fn with_snapshots(root: File, snapshots: File, read_only: bool) -> io::Result<Self> {
-		let pool = Arc::new(SnapshotPool::new(snapshots)?);
-		let state = FsState::new(root, Some(pool), read_only)?;
+		let state = FsState::new(root, read_only)?;
 		Ok(Self {
 			index: None,
 			state: RefCell::new(state),
@@ -218,7 +184,7 @@ impl PassthroughFs {
 }
 
 impl FsState {
-	fn new(root: File, snapshots: Option<Arc<SnapshotPool>>, read_only: bool) -> io::Result<Self> {
+	fn new(root: File, read_only: bool) -> io::Result<Self> {
 		let metadata = root.metadata()?;
 		if !metadata.is_dir() {
 			return Err(errno(libc::ENOTDIR));
@@ -241,7 +207,6 @@ impl FsState {
 		identities.insert(identity, ROOT_ID);
 		Ok(Self {
 			read_only,
-			snapshots,
 			nodes,
 			identities,
 			next_inode: ROOT_ID + 1,
@@ -721,90 +686,35 @@ impl FsState {
 		}
 	}
 
-	fn pool(&self) -> io::Result<&Arc<SnapshotPool>> {
-		self.snapshots
-			.as_ref()
-			.ok_or_else(|| errno(libc::EOPNOTSUPP))
-	}
-
-	fn snapshot(&self) -> io::Result<u64> {
-		let pool = Arc::clone(self.pool()?);
-		let src = &self.node(ROOT_ID)?.path;
-		let id = pool.allocate_id();
-		let dst = pool.dir.join(format!("snap-{id}"));
-		fs::create_dir(&dst)?;
-		if let Err(err) = clone_dir_contents(src, &dst) {
-			drop(fs::remove_dir_all(&dst));
-			return Err(err);
-		}
-		Ok(id)
-	}
-
-	fn branch(&self, id: u64) -> io::Result<PassthroughFs> {
-		let pool = Arc::clone(self.pool()?);
-		let snap_path = pool.dir.join(format!("snap-{id}"));
-		if !snap_path.is_dir() {
-			return Err(errno(libc::ENOENT));
-		}
-		let work_id = pool.allocate_id();
-		let work_path = pool.dir.join(format!("work-{work_id}"));
-		fs::create_dir(&work_path)?;
-		if let Err(err) = clone_dir_contents(&snap_path, &work_path) {
-			drop(fs::remove_dir_all(&work_path));
-			return Err(err);
-		}
-		let work_root = inspect_path(&work_path)?;
-		let state = FsState::new(work_root, Some(pool), false)?;
-		Ok(PassthroughFs {
-			index: None,
-			state: RefCell::new(state),
-		})
-	}
-
-	fn restore(&mut self, id: u64) -> io::Result<()> {
+	fn volume_clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
 		self.writable()?;
-		let pool = Arc::clone(self.pool()?);
-		let snap_path = pool.dir.join(format!("snap-{id}"));
-		if !snap_path.is_dir() {
-			return Err(errno(libc::ENOENT));
+		let src_parts = split_path(src)?;
+		let dst_parts = split_path(dst)?;
+		if src_parts.is_empty() || dst_parts.is_empty() || dst_parts.starts_with(&src_parts) {
+			return Err(errno(libc::EINVAL));
 		}
-		let root_path = self.node(ROOT_ID)?.path.clone();
-		clear_dir_contents(&root_path)?;
-		clone_dir_contents(&snap_path, &root_path)?;
-		let root_node = self.nodes.remove(&ROOT_ID).expect("root node exists");
-		let identity = file_identity(&root_node.file)?;
-		self.nodes.clear();
-		self.identities.clear();
-		self.nodes.insert(
-			ROOT_ID,
-			Node {
-				file: root_node.file,
-				path: root_node.path,
-				parent: ROOT_ID,
-				name: root_node.name,
-				lookups: 1,
-			},
-		);
-		self.identities.insert(identity, ROOT_ID);
+		let src_path = self.resolve_volume_path(src)?;
+		let dst_path = self.resolve_volume_path(dst)?;
+		if fs::symlink_metadata(&dst_path).is_ok() {
+			return Err(errno(libc::EEXIST));
+		}
+		let Some(dst_parent) = dst_path.parent() else {
+			return Err(errno(libc::ENOENT));
+		};
+		if !fs::symlink_metadata(dst_parent)?.is_dir() {
+			return Err(errno(libc::ENOTDIR));
+		}
+		let meta = fs::symlink_metadata(&src_path)?;
+		if meta.is_dir() {
+			fs::create_dir(&dst_path)?;
+			if let Err(err) = clone_dir_contents(&src_path, &dst_path) {
+				drop(fs::remove_dir_all(&dst_path));
+				return Err(err);
+			}
+		} else {
+			fs::copy(&src_path, &dst_path)?;
+		}
 		Ok(())
-	}
-
-	fn delete_snapshot(&self, id: u64) -> io::Result<()> {
-		let pool = Arc::clone(self.pool()?);
-		let snap_path = pool.dir.join(format!("snap-{id}"));
-		if !snap_path.exists() {
-			return Err(errno(libc::ENOENT));
-		}
-		fs::remove_dir_all(snap_path)
-	}
-
-	fn snapshot_root(&self, id: u64) -> io::Result<File> {
-		let pool = Arc::clone(self.pool()?);
-		let snap_path = pool.dir.join(format!("snap-{id}"));
-		if !snap_path.is_dir() {
-			return Err(errno(libc::ENOENT));
-		}
-		inspect_path(&snap_path)
 	}
 
 	fn volume_walk(&self, path: &Path) -> io::Result<Vec<WalkEntry>> {
@@ -1206,44 +1116,6 @@ impl Fuse for PassthroughFs {
 	}
 }
 
-impl Snapshot for PassthroughFs {
-	type Id = u64;
-
-	async fn snapshot(&self) -> io::Result<u64> {
-		self.with(|state| state.snapshot())
-	}
-
-	async fn branch(&self, id: &u64) -> io::Result<Self> {
-		let mut branch = self.with(|state| state.branch(*id))?;
-		branch.index = self
-			.index
-			.as_ref()
-			.map(|i| Arc::new(SearchIndex::new(*i.options())));
-		Ok(branch)
-	}
-
-	async fn restore(&self, id: &u64) -> io::Result<()> {
-		async { self.with(|state| state.restore(*id)) }.await?;
-		if let Some(idx) = &self.index {
-			idx.notify_reset();
-		}
-		Ok(())
-	}
-
-	async fn delete(&self, id: &u64) -> io::Result<()> {
-		self.with(|state| state.delete_snapshot(*id))
-	}
-
-	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
-		let snapshot = {
-			let state = self.state.borrow();
-			let root = state.snapshot_root(*id)?;
-			PassthroughFs::new(root, true)?
-		};
-		diff_volumes(&snapshot, self, scope).await
-	}
-}
-
 impl Volume for PassthroughFs {
 	async fn getxattr(&self, _path: &Path, _name: &CStr) -> io::Result<Vec<u8>> {
 		Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
@@ -1504,6 +1376,14 @@ impl Volume for PassthroughFs {
 			idx.persist_roots(self).await;
 		}
 		Ok(result)
+	}
+
+	async fn clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
+		async { self.with(|state| state.volume_clone_tree(src, dst)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_reset();
+		}
+		Ok(())
 	}
 }
 

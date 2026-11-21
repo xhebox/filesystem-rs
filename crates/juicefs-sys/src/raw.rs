@@ -256,6 +256,8 @@ impl Default for juicefs_mount_options {
 		}
 	}
 }
+pub type juicefs_task_fn =
+	::std::option::Option<unsafe extern "C" fn(arg: *mut ::std::os::raw::c_void)>;
 unsafe extern "C" {
 	pub fn juicefs_format(
 		payload: *mut ::std::os::raw::c_char,
@@ -275,6 +277,14 @@ unsafe extern "C" {
 		options: *mut juicefs_mount_options,
 		err: *mut usize,
 	) -> usize;
+}
+unsafe extern "C" {
+	pub fn juicefs_dispatch(
+		h: usize,
+		fn_: juicefs_task_fn,
+		arg: *mut ::std::os::raw::c_void,
+		isBlockingLock: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
 	pub fn juicefs_unmount(h: usize);
@@ -689,5 +699,34 @@ unsafe extern "C" {
 		ino: u64,
 		fh: u64,
 		off: u64,
+	) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+	pub fn juicefs_clone(
+		h: usize,
+		ctx: *mut juicefs_ctx,
+		srcParentIno: u64,
+		srcIno: u64,
+		dstParentIno: u64,
+		dstName: *mut ::std::os::raw::c_char,
+		concurrency: u8,
+	) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+	pub fn juicefs_remove_tree(
+		h: usize,
+		ctx: *mut juicefs_ctx,
+		parentIno: u64,
+		name: *mut ::std::os::raw::c_char,
+		skipTrash: u8,
+		numThreads: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+	pub fn juicefs_resolve(
+		h: usize,
+		ctx: *mut juicefs_ctx,
+		relPath: *mut ::std::os::raw::c_char,
+		out: *mut juicefs_entry,
 	) -> ::std::os::raw::c_int;
 }
