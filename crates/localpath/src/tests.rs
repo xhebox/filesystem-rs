@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use api::{Attr, Context, DiffKind, Fuse, Memory, MemoryRange, Snapshot, Volume, ZeroCopyWriter};
+use api::{
+	Attr, Context, DiffKind, Fuse, Memory, MemoryRange, SubVolume, Volume, ZeroCopyWriter,
+	diff_trees,
+};
 use completion::AsIoVec;
 
 use crate::PassthroughFs;
@@ -602,113 +605,81 @@ fn a_read_past_the_end_of_a_file_is_a_short_count() {
 }
 
 #[test]
-fn snapshot_without_pool_is_unsupported() {
-	let (_dir, _path, root) = root();
+fn clone_tree_preserves_files_hardlinks_xattrs_and_deletes() {
+	let (_dir, path, root) = root();
 	let fs = filesystem(root, false);
-	assert_eq!(
-		completion::block_on(fs.snapshot())
-			.unwrap()
-			.unwrap_err()
-			.raw_os_error(),
-		Some(libc::EOPNOTSUPP)
-	);
-}
-
-#[test]
-fn snapshot_branch_restore_and_delete() {
-	let (dir, path, root) = root();
-	let pool_path = dir.path().join("snapshots");
-	fs::create_dir(&pool_path).unwrap();
-	let pool = OpenOptions::new().read(true).open(&pool_path).unwrap();
-
-	let fs = PassthroughFs::with_snapshots(root, pool, false).unwrap();
 	let context = Context::default();
 
-	fs::write(path.join("file"), b"v1").unwrap();
-	fs::hard_link(path.join("file"), path.join("hard")).unwrap();
-	fs::create_dir(path.join("sub")).unwrap();
-	fs::write(path.join("sub/nested"), b"nested-v1").unwrap();
-	symlink("file", path.join("sym")).unwrap();
+	fs::create_dir(path.join("main")).unwrap();
+	fs::write(path.join("main/file"), b"v1").unwrap();
+	fs::hard_link(path.join("main/file"), path.join("main/hard")).unwrap();
+	fs::create_dir(path.join("main/sub")).unwrap();
+	fs::write(path.join("main/sub/nested"), b"nested-v1").unwrap();
+	symlink("file", path.join("main/sym")).unwrap();
+	let main_entry = fs
+		.with(|state| state.lookup(&context, ROOT_ID, c"main"))
+		.unwrap();
 	let file_entry = fs
-		.with(|state| state.lookup(&context, ROOT_ID, c"file"))
+		.with(|state| state.lookup(&context, main_entry.inode, c"file"))
 		.unwrap();
 	fs.with(|state| state.set_xattr(&context, file_entry.inode, c"user.ver", b"1", 0))
 		.unwrap();
 
-	let snap1 = completion::block_on(fs.snapshot()).unwrap().unwrap();
-
-	// Mutate the live workspace after taking `snap1`.
-	fs::write(path.join("file"), b"v2").unwrap();
-	fs::write(path.join("extra"), b"added").unwrap();
-	fs::remove_file(path.join("sym")).unwrap();
-
-	// Branching from `snap1` yields an isolated workspace at `snap1`'s state.
-	let branched = completion::block_on(fs.branch(&snap1)).unwrap().unwrap();
-	let branched_file = branched
-		.with(|state| state.lookup(&context, ROOT_ID, c"file"))
-		.unwrap();
-	let branched_hard = branched
-		.with(|state| state.lookup(&context, ROOT_ID, c"hard"))
-		.unwrap();
-	assert_eq!(branched_file.inode, branched_hard.inode);
+	run(Volume::clone_tree(
+		&fs,
+		Path::new("/main"),
+		Path::new("/feat"),
+	))
+	.unwrap();
 	assert_eq!(
-		branched
-			.with(|state| state.get_xattr(&context, branched_file.inode, Some(c"user.ver"), 0))
+		run(Volume::clone_tree(
+			&fs,
+			Path::new("/main"),
+			Path::new("/feat"),
+		))
+		.unwrap_err()
+		.raw_os_error(),
+		Some(libc::EEXIST)
+	);
+
+	// Mutate `/main` after cloning to `/feat`.
+	fs::write(path.join("main/file"), b"v2").unwrap();
+	fs::write(path.join("main/extra"), b"added").unwrap();
+	fs::remove_file(path.join("main/sym")).unwrap();
+
+	// `/feat` stays isolated at the cloned state, preserving hardlinks, xattrs, and symlinks.
+	let feat_entry = fs
+		.with(|state| state.lookup(&context, ROOT_ID, c"feat"))
+		.unwrap();
+	let feat_file = fs
+		.with(|state| state.lookup(&context, feat_entry.inode, c"file"))
+		.unwrap();
+	let feat_hard = fs
+		.with(|state| state.lookup(&context, feat_entry.inode, c"hard"))
+		.unwrap();
+	assert_eq!(feat_file.inode, feat_hard.inode);
+	assert_eq!(
+		fs.with(|state| state.get_xattr(&context, feat_file.inode, Some(c"user.ver"), 0))
 			.unwrap(),
 		b"1"
 	);
-	let branched_handle = branched
-		.with(|state| state.open(&context, branched_file.inode, libc::O_RDONLY as u32))
-		.unwrap();
-	let mut data = [0u8; 8];
-	let count = completion::block_on(async {
-		let state = branched.state.borrow();
-		state.read(branched_handle, 0, &mut data).await
-	})
-	.unwrap()
-	.unwrap();
-	assert_eq!(&data[..count], b"v1");
-	branched
-		.with(|state| state.release(branched_handle))
-		.unwrap();
-	assert!(
-		branched
-			.with(|state| state.lookup(&context, ROOT_ID, c"extra"))
-			.is_err()
-	);
-	let branched_sym = branched
-		.with(|state| state.lookup(&context, ROOT_ID, c"sym"))
-		.unwrap();
+	let feat_view = SubVolume::new(&fs, "/feat").unwrap();
 	assert_eq!(
-		branched
-			.with(|state| state.read_link(branched_sym.inode))
-			.unwrap(),
+		run(Volume::read(&feat_view, Path::new("/file"))).unwrap(),
+		b"v1"
+	);
+	assert_eq!(
+		run(Volume::read(&feat_view, Path::new("/sub/nested"))).unwrap(),
+		b"nested-v1"
+	);
+	assert!(run(Volume::stat(&feat_view, Path::new("/extra"))).is_err());
+	assert_eq!(
+		run(Volume::readlink(&feat_view, Path::new("/sym"))).unwrap(),
 		b"file"
 	);
 
-	// Recursive snapshot from a branched workspace.
-	let snap2 = completion::block_on(branched.snapshot()).unwrap().unwrap();
-	completion::block_on(branched.delete(&snap2))
-		.unwrap()
-		.unwrap();
-
-	// Restore the original workspace back to `snap1`.
-	completion::block_on(fs.restore(&snap1)).unwrap().unwrap();
-	assert_eq!(fs::read(path.join("file")).unwrap(), b"v1");
-	assert_eq!(fs::read(path.join("sub/nested")).unwrap(), b"nested-v1");
-	assert!(!path.join("extra").exists());
-	assert_eq!(fs::read_link(path.join("sym")).unwrap(), Path::new("file"));
-
-	// Deleting `snap1` reclaims it; branching from it afterwards fails with ENOENT.
-	completion::block_on(fs.delete(&snap1)).unwrap().unwrap();
-	assert_eq!(
-		completion::block_on(fs.branch(&snap1))
-			.unwrap()
-			.err()
-			.unwrap()
-			.raw_os_error(),
-		Some(libc::ENOENT)
-	);
+	run(Volume::remove_all(&fs, Path::new("/feat"))).unwrap();
+	assert!(!path.join("feat").exists());
 }
 
 #[test]
@@ -831,44 +802,55 @@ fn volume_read_range_is_bounded_at_eof_and_never_overflows() {
 }
 
 #[test]
-fn snapshot_diff_compares_content_and_copied_trees() {
-	let (dir, path, root) = root();
-	let pool_path = dir.path().join("snapshots");
-	fs::create_dir(&pool_path).unwrap();
-	let pool = OpenOptions::new().read(true).open(&pool_path).unwrap();
-	let fs = PassthroughFs::with_snapshots(root, pool, false).unwrap();
+fn diff_trees_compares_content_and_copied_trees() {
+	let (_dir, path, root) = root();
+	let fs = filesystem(root, false);
 
-	fs::create_dir(path.join("sub")).unwrap();
-	fs::write(path.join("keep"), b"keep").unwrap();
-	fs::write(path.join("edit"), b"AAAA").unwrap();
-	fs::write(path.join("remove"), b"gone").unwrap();
-	fs::write(path.join("kind"), b"file").unwrap();
-	fs::write(path.join("sub/nested"), b"one!").unwrap();
-	fs::write(path.join("sub/removed"), b"old!").unwrap();
-	symlink("keep", path.join("link")).unwrap();
-	let snapshot = run(fs.snapshot()).unwrap();
+	fs::create_dir_all(path.join("base/sub")).unwrap();
+	fs::write(path.join("base/keep"), b"keep").unwrap();
+	fs::write(path.join("base/edit"), b"AAAA").unwrap();
+	fs::write(path.join("base/remove"), b"gone").unwrap();
+	fs::write(path.join("base/kind"), b"file").unwrap();
+	fs::write(path.join("base/sub/nested"), b"one!").unwrap();
+	fs::write(path.join("base/sub/removed"), b"old!").unwrap();
+	symlink("keep", path.join("base/link")).unwrap();
+	run(Volume::clone_tree(
+		&fs,
+		Path::new("/base"),
+		Path::new("/work"),
+	))
+	.unwrap();
 
 	// Detect same-size edits with unchanged mtime; ignore copied inode/ctime.
-	let original_mtime = fs::metadata(path.join("edit")).unwrap().modified().unwrap();
-	fs::write(path.join("edit"), b"BBBB").unwrap();
+	let original_mtime = fs::metadata(path.join("work/edit"))
+		.unwrap()
+		.modified()
+		.unwrap();
+	fs::write(path.join("work/edit"), b"BBBB").unwrap();
 	OpenOptions::new()
 		.write(true)
-		.open(path.join("edit"))
+		.open(path.join("work/edit"))
 		.unwrap()
 		.set_times(FileTimes::new().set_modified(original_mtime))
 		.unwrap();
-	fs::write(path.join("sub/nested"), b"two!").unwrap();
-	fs::write(path.join("add"), b"new").unwrap();
-	fs::write(path.join("sub/added"), b"new").unwrap();
-	fs::remove_file(path.join("remove")).unwrap();
-	fs::remove_file(path.join("sub/removed")).unwrap();
-	fs::remove_file(path.join("kind")).unwrap();
-	fs::create_dir(path.join("kind")).unwrap();
-	fs::write(path.join("kind/child"), b"x").unwrap();
-	fs::remove_file(path.join("link")).unwrap();
-	symlink("add", path.join("link")).unwrap();
+	fs::write(path.join("work/sub/nested"), b"two!").unwrap();
+	fs::write(path.join("work/add"), b"new").unwrap();
+	fs::write(path.join("work/sub/added"), b"new").unwrap();
+	fs::remove_file(path.join("work/remove")).unwrap();
+	fs::remove_file(path.join("work/sub/removed")).unwrap();
+	fs::remove_file(path.join("work/kind")).unwrap();
+	fs::create_dir(path.join("work/kind")).unwrap();
+	fs::write(path.join("work/kind/child"), b"x").unwrap();
+	fs::remove_file(path.join("work/link")).unwrap();
+	symlink("add", path.join("work/link")).unwrap();
 
-	let diff = run(fs.diff(&snapshot, Path::new("/"))).unwrap();
+	let diff = run(diff_trees(
+		&fs,
+		Path::new("/base"),
+		Path::new("/work"),
+		Path::new("/"),
+	))
+	.unwrap();
 	let changed: Vec<(PathBuf, DiffKind)> = diff
 		.into_iter()
 		.map(|entry| (entry.path, entry.kind))
@@ -888,7 +870,13 @@ fn snapshot_diff_compares_content_and_copied_trees() {
 		]
 	);
 
-	let scoped = run(fs.diff(&snapshot, Path::new("sub"))).unwrap();
+	let scoped = run(diff_trees(
+		&fs,
+		Path::new("/base"),
+		Path::new("/work"),
+		Path::new("sub"),
+	))
+	.unwrap();
 	assert_eq!(
 		scoped
 			.into_iter()
@@ -901,17 +889,24 @@ fn snapshot_diff_compares_content_and_copied_trees() {
 		]
 	);
 
-	// The snapshot remains unchanged.
-	let branched = run(fs.branch(&snapshot)).unwrap();
-	assert_eq!(
-		run(Volume::read(&branched, Path::new("/edit"))).unwrap(),
-		b"AAAA"
+	assert!(
+		run(diff_trees(
+			&fs,
+			Path::new("/base"),
+			Path::new("/work"),
+			Path::new("/missing"),
+		))
+		.is_err()
 	);
-	assert!(run(fs.diff(&snapshot, Path::new("/missing"))).is_err());
-	assert!(run(fs.diff(&999, Path::new("/"))).is_err());
-
-	run(fs.restore(&snapshot)).unwrap();
-	assert!(run(fs.diff(&snapshot, Path::new("/"))).unwrap().is_empty());
+	assert!(
+		run(diff_trees(
+			&fs,
+			Path::new("/missing_a"),
+			Path::new("/missing_b"),
+			Path::new("/"),
+		))
+		.is_err()
+	);
 }
 
 #[test]
@@ -1047,35 +1042,34 @@ fn path_xattrs_search_and_external_changes() {
 }
 
 #[test]
-fn indexed_search_snapshot_restores_xattrs() {
+fn indexed_search_clone_tree_preserves_xattrs() {
 	use api::{IndexOptions, Search, SearchQuery, XATTR_SIG_NAME};
 	let scratch = Scratch::new();
 	let host = scratch.path().join("root");
-	let pool = scratch.path().join("snapshots");
 	fs::create_dir(&host).unwrap();
-	fs::create_dir(&pool).unwrap();
-	let fs = PassthroughFs::with_snapshots(
-		File::open(&host).unwrap(),
-		File::open(&pool).unwrap(),
-		false,
-	)
-	.unwrap()
-	.with_index(IndexOptions::default());
+	let fs = PassthroughFs::new(File::open(&host).unwrap(), false)
+		.unwrap()
+		.with_index(IndexOptions::default());
 	run(async {
-		let path = Path::new("/text");
+		Volume::create_dir_all(&fs, Path::new("/main"))
+			.await
+			.unwrap();
+		let path = Path::new("/main/text");
 		Volume::write(&fs, path, b"old snapshot text\n")
 			.await
 			.unwrap();
 		let raw = Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap();
-		let id = fs.snapshot().await.unwrap();
+		assert!(!raw.is_empty());
+		Volume::clone_tree(&fs, Path::new("/main"), Path::new("/snap"))
+			.await
+			.unwrap();
 		Volume::write(&fs, path, b"new text\n").await.unwrap();
-		fs.restore(&id).await.unwrap();
-		assert_eq!(
-			Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap(),
-			raw
-		);
+		let snap_raw = Volume::getxattr(&fs, Path::new("/snap/text"), XATTR_SIG_NAME)
+			.await
+			.unwrap();
+		assert_eq!(snap_raw, raw);
 		let found = fs
-			.search(Path::new("/"), &SearchQuery::new("snapshot"))
+			.search(Path::new("/snap"), &SearchQuery::new("snapshot"))
 			.await
 			.unwrap();
 		assert_eq!(found.len(), 1);

@@ -104,11 +104,20 @@ typedef struct {
 	uint8_t writeback;
 	uint8_t backup_skip_trash;
 } juicefs_mount_options;
+
+typedef void (*juicefs_task_fn)(void *arg);
+
+static inline void juicefs_call_task(juicefs_task_fn fn, void *arg) {
+	fn(arg);
+}
 */
 import "C"
 
 import (
+	"path"
 	"runtime/cgo"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -118,10 +127,45 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
+const (
+	dispatchWorkers   = 64
+	dispatchQueueSize = 1024
+	blockingLockLimit = 64
+)
+
+type dispatchTask struct {
+	fn  C.juicefs_task_fn
+	arg unsafe.Pointer
+}
+
 // One mounted volume. The VFS tracks its own inodes and handles.
 type session struct {
-	v    *vfs.VFS
-	blob object.ObjectStorage
+	v       *vfs.VFS
+	blob    object.ObjectStorage
+	mu      sync.RWMutex
+	closing atomic.Bool
+	jobs    chan dispatchTask
+	lockSem chan struct{}
+	wg      sync.WaitGroup
+}
+
+func newSession(v *vfs.VFS, blob object.ObjectStorage) *session {
+	s := &session{
+		v:       v,
+		blob:    blob,
+		jobs:    make(chan dispatchTask, dispatchQueueSize),
+		lockSem: make(chan struct{}, blockingLockLimit),
+	}
+	s.wg.Add(dispatchWorkers)
+	for range dispatchWorkers {
+		go func() {
+			defer s.wg.Done()
+			for t := range s.jobs {
+				C.juicefs_call_task(t.fn, t.arg)
+			}
+		}()
+	}
+	return s
 }
 
 // juicefs_format formats or initializes one volume at `payload`. Returns 0 on
@@ -198,7 +242,48 @@ func juicefs_mount(payload *C.char, options *C.juicefs_mount_options, err *C.uin
 		*err = newBytes([]byte(mountErr.Error()))
 		return 0
 	}
-	return C.uintptr_t(cgo.NewHandle(&session{v: v, blob: blob}))
+	return C.uintptr_t(cgo.NewHandle(newSession(v, blob)))
+}
+
+// juicefs_dispatch schedules `fn(arg)` onto the session's bounded Go goroutine
+// pool without blocking the caller. Returns 0 when queued, `EAGAIN` when the
+// bounded queue or blocking-lock quota is full, or `ESHUTDOWN` when unmounting.
+//
+//export juicefs_dispatch
+func juicefs_dispatch(h C.uintptr_t, fn C.juicefs_task_fn, arg unsafe.Pointer, isBlockingLock C.int) C.int {
+	s := lookup(h)
+	if s == nil || fn == nil {
+		return C.int(syscall.EINVAL)
+	}
+	s.mu.RLock()
+	if s.closing.Load() {
+		s.mu.RUnlock()
+		return C.int(syscall.ESHUTDOWN)
+	}
+	if isBlockingLock != 0 {
+		select {
+		case s.lockSem <- struct{}{}:
+			s.wg.Add(1)
+			s.mu.RUnlock()
+			go func() {
+				defer s.wg.Done()
+				defer func() { <-s.lockSem }()
+				C.juicefs_call_task(fn, arg)
+			}()
+			return 0
+		default:
+			s.mu.RUnlock()
+			return C.int(syscall.EAGAIN)
+		}
+	}
+	select {
+	case s.jobs <- dispatchTask{fn: fn, arg: arg}:
+		s.mu.RUnlock()
+		return 0
+	default:
+		s.mu.RUnlock()
+		return C.int(syscall.EAGAIN)
+	}
 }
 
 // juicefs_unmount drops one volume's session. The handle is not reused.
@@ -209,6 +294,12 @@ func juicefs_unmount(h C.uintptr_t) {
 		return
 	}
 	if s := lookup(h); s != nil {
+		s.mu.Lock()
+		if !s.closing.Swap(true) {
+			close(s.jobs)
+		}
+		s.mu.Unlock()
+		s.wg.Wait()
 		if s.v != nil {
 			_ = s.v.FlushAll("")
 			_ = s.v.Meta.CloseSession()
@@ -853,6 +944,122 @@ func juicefs_dirents_free(list C.uintptr_t) {
 func juicefs_update_readdir_offset(h C.uintptr_t, ctx *C.juicefs_ctx, ino, fh C.uint64_t, off C.uint64_t) C.int {
 	return guard(h, func(s *session) C.int {
 		s.v.UpdateReaddirOffset(s.context(ctx), meta.Ino(ino), uint64(fh), int(off))
+		return 0
+	})
+}
+
+// juicefs_clone clones `srcIno` (whose parent is `srcParentIno`) into
+// `dstParentIno` under `dstName` within the same mounted volume using
+// `Meta.Clone`.
+//
+//export juicefs_clone
+func juicefs_clone(
+	h C.uintptr_t,
+	ctx *C.juicefs_ctx,
+	srcParentIno, srcIno, dstParentIno C.uint64_t,
+	dstName *C.char,
+	concurrency C.uint8_t,
+) C.int {
+	return guard(h, func(s *session) C.int {
+		name := C.GoString(dstName)
+		if name == "" {
+			return C.int(syscall.EINVAL)
+		}
+		conc := uint8(concurrency)
+		if conc == 0 {
+			conc = meta.CLONE_DEFAULT_CONCURRENCY
+		}
+		var count, total uint64
+		eno := s.v.Meta.Clone(
+			s.context(ctx),
+			meta.Ino(srcParentIno),
+			meta.Ino(srcIno),
+			meta.Ino(dstParentIno),
+			name,
+			meta.CLONE_MODE_PRESERVE_ATTR|meta.CLONE_MODE_PRESERVE_HARDLINKS,
+			0,
+			conc,
+			&count,
+			&total,
+		)
+		return C.int(eno)
+	})
+}
+
+// juicefs_remove_tree recursively removes `name` under `parentIno` using
+// `Meta.Remove`.
+//
+//export juicefs_remove_tree
+func juicefs_remove_tree(
+	h C.uintptr_t,
+	ctx *C.juicefs_ctx,
+	parentIno C.uint64_t,
+	name *C.char,
+	skipTrash C.uint8_t,
+	numThreads C.int,
+) C.int {
+	return guard(h, func(s *session) C.int {
+		goName := C.GoString(name)
+		if goName == "" {
+			return C.int(syscall.EINVAL)
+		}
+		threads := int(numThreads)
+		if threads <= 0 {
+			threads = 8
+		}
+		var count uint64
+		eno := s.v.Meta.Remove(
+			s.context(ctx),
+			meta.Ino(parentIno),
+			goName,
+			skipTrash != 0,
+			threads,
+			&count,
+		)
+		if eno == 0 && s.v.InvalidateEntry != nil {
+			_ = s.v.InvalidateEntry(meta.Ino(parentIno), goName)
+		}
+		return C.int(eno)
+	})
+}
+
+// juicefs_resolve resolves a `/`-separated path relative to the mounted root
+// (respecting `subdir` if configured) in a single metadata call via
+// `Meta.Resolve`.
+//
+//export juicefs_resolve
+func juicefs_resolve(
+	h C.uintptr_t,
+	ctx *C.juicefs_ctx,
+	relPath *C.char,
+	out *C.juicefs_entry,
+) C.int {
+	return guard(h, func(s *session) C.int {
+		p := C.GoString(relPath)
+		if s.v.Conf != nil && s.v.Conf.Subdir != "" {
+			p = path.Join(s.v.Conf.Subdir, p)
+		}
+		for len(p) > 0 && p[0] == '/' {
+			p = p[1:]
+		}
+		if p == "" {
+			e, err := s.v.GetAttr(s.context(ctx), 1, 0)
+			if err != 0 {
+				return C.int(err)
+			}
+			*out = entry(e)
+			return 0
+		}
+		var ino meta.Ino
+		var a meta.Attr
+		eno := s.v.Meta.Resolve(s.context(ctx), 1, p, &ino, &a, true)
+		if eno != 0 {
+			return C.int(eno)
+		}
+		*out = C.juicefs_entry{
+			ino:  C.uint64_t(ino),
+			attr: attr(&a),
+		}
 		return 0
 	})
 }

@@ -14,7 +14,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
 
-use api::{DiffKind, Snapshot, Volume};
+use api::{DiffKind, Volume, diff_trees};
 use boxfs_juicefs::MountOptions;
 
 /// Polls a future while the volume's worker threads perform I/O.
@@ -101,27 +101,40 @@ fn walk_read_range_and_diff() {
 	assert!(run(Volume::read_range(&volume, &root.join("keep"), 4, 2)).is_empty());
 	assert!(run(Volume::read_range(&volume, &root.join("keep"), 1, 0)).is_empty());
 
-	let snapshot = run(Snapshot::snapshot(&volume));
-	run(Volume::write(&volume, &root.join("edit"), b"BBBB"));
-	run(Volume::write(&volume, &root.join("sub/nested"), b"two!"));
-	run(Volume::write(&volume, &root.join("add"), b"new"));
-	run(Volume::write(&volume, &root.join("sub/added"), b"new"));
-	run(Volume::remove_file(&volume, &root.join("remove")));
-	run(Volume::remove_file(&volume, &root.join("sub/removed")));
-	run(Volume::remove_file(&volume, &root.join("kind")));
-	run(Volume::create_dir(&volume, &root.join("kind")));
-	run(Volume::write(&volume, &root.join("kind/child"), b"x"));
-	run(Volume::remove_file(&volume, &root.join("link")));
+	let work_root = Path::new("/boxfs-test-work");
+	drop(try_run(Volume::remove_all(&volume, work_root)));
+	run(Volume::clone_tree(&volume, root, work_root));
+	assert_eq!(
+		try_run(Volume::clone_tree(&volume, root, work_root))
+			.unwrap_err()
+			.kind(),
+		std::io::ErrorKind::AlreadyExists
+	);
+	run(Volume::write(&volume, &work_root.join("edit"), b"BBBB"));
+	run(Volume::write(
+		&volume,
+		&work_root.join("sub/nested"),
+		b"two!",
+	));
+	run(Volume::write(&volume, &work_root.join("add"), b"new"));
+	run(Volume::write(&volume, &work_root.join("sub/added"), b"new"));
+	run(Volume::remove_file(&volume, &work_root.join("remove")));
+	run(Volume::remove_file(&volume, &work_root.join("sub/removed")));
+	run(Volume::remove_file(&volume, &work_root.join("kind")));
+	run(Volume::create_dir(&volume, &work_root.join("kind")));
+	run(Volume::write(&volume, &work_root.join("kind/child"), b"x"));
+	run(Volume::remove_file(&volume, &work_root.join("link")));
 	run(Volume::symlink(
 		&volume,
 		Path::new("add"),
-		&root.join("link"),
+		&work_root.join("link"),
 	));
 
-	let changed: Vec<(PathBuf, DiffKind)> = run(Snapshot::diff(&volume, &snapshot, root))
-		.into_iter()
-		.map(|entry| (entry.path, entry.kind))
-		.collect();
+	let changed: Vec<(PathBuf, DiffKind)> =
+		run(diff_trees(&volume, root, work_root, Path::new("/")))
+			.into_iter()
+			.map(|entry| (entry.path, entry.kind))
+			.collect();
 	assert_eq!(
 		changed,
 		vec![
@@ -137,7 +150,7 @@ fn walk_read_range_and_diff() {
 		]
 	);
 	let scoped: Vec<(PathBuf, DiffKind)> =
-		run(Snapshot::diff(&volume, &snapshot, &root.join("sub")))
+		run(diff_trees(&volume, root, work_root, Path::new("sub")))
 			.into_iter()
 			.map(|entry| (entry.path, entry.kind))
 			.collect();
@@ -149,11 +162,9 @@ fn walk_read_range_and_diff() {
 			(PathBuf::from("removed"), DiffKind::Removed),
 		]
 	);
-	assert!(try_run(Snapshot::diff(&volume, &snapshot, &root.join("missing"))).is_err());
+	assert!(try_run(diff_trees(&volume, root, work_root, Path::new("missing"))).is_err());
 
-	run(Snapshot::restore(&volume, &snapshot));
-	assert!(run(Snapshot::diff(&volume, &snapshot, root)).is_empty());
-	run(Snapshot::delete(&volume, &snapshot));
+	run(Volume::remove_all(&volume, work_root));
 	run(Volume::remove_all(&volume, root));
 }
 

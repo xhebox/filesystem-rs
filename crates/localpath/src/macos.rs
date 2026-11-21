@@ -1,7 +1,7 @@
 //! macOS confined passthrough filesystem and its FUSE protocol surface.
 //!
-//! [`PassthroughFs`] implements [`api::Fuse`], [`api::Volume`], and
-//! [`api::Snapshot`] directly. Request parsing, dispatch, and reply encoding belong to whoever drives the file
+//! [`PassthroughFs`] implements [`api::Fuse`] and [`api::Volume`] directly.
+//! Request parsing, dispatch, and reply encoding belong to whoever drives the file
 //! system; this module holds the confined state (inode table, handles) and
 //! performs the host I/O.
 //!
@@ -40,7 +40,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::{
 	FATTR_ATIME, FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
@@ -48,9 +47,8 @@ use crate::abi::{
 };
 use crate::span::{engine_io, read_exact, read_into, write_into};
 use api::{
-	Attr, Context, CreateArgs, DiffEntry, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply,
-	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
-	diff_volumes,
+	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
+	ListxattrReply, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
 };
 use api::{IndexOptions, Search, SearchIndex};
 
@@ -132,35 +130,10 @@ pub(crate) struct RawDirEntry {
 	pub(crate) name: Vec<u8>,
 }
 
-/// Confined directory holding snapshots and branched workspaces.
-struct SnapshotPool {
-	dir: File,
-	next_id: AtomicU64,
-}
-
-impl SnapshotPool {
-	fn new(dir: File) -> io::Result<Self> {
-		if !dir.metadata()?.is_dir() {
-			return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-		}
-		probe(dir.as_raw_fd())?;
-		let confined = open_dir_fd(dir.as_raw_fd(), c".")?;
-		Ok(Self {
-			dir: confined,
-			next_id: AtomicU64::new(1),
-		})
-	}
-
-	fn allocate_id(&self) -> u64 {
-		self.next_id.fetch_add(1, Ordering::Relaxed)
-	}
-}
-
 /// The mutable filesystem state. See [`PassthroughFs`] for the threading
 /// model; everything here is confined to the thread that drives the back-end.
 pub(crate) struct FsState {
 	read_only: bool,
-	snapshots: Option<Arc<SnapshotPool>>,
 	nodes: HashMap<Inode, Node>,
 	identities: HashMap<(u64, u64), Inode>,
 	next_inode: Inode,
@@ -193,18 +166,7 @@ impl PassthroughFs {
 	}
 
 	pub fn new(root: File, read_only: bool) -> io::Result<Self> {
-		let state = FsState::new(root, None, read_only)?;
-		Ok(Self {
-			index: None,
-			state: RefCell::new(state),
-		})
-	}
-
-	/// Creates a [`PassthroughFs`] backed by `snapshots` for [`Snapshot`]
-	/// operations (`snapshot`, `branch`, `restore`, `delete`).
-	pub fn with_snapshots(root: File, snapshots: File, read_only: bool) -> io::Result<Self> {
-		let pool = Arc::new(SnapshotPool::new(snapshots)?);
-		let state = FsState::new(root, Some(pool), read_only)?;
+		let state = FsState::new(root, read_only)?;
 		Ok(Self {
 			index: None,
 			state: RefCell::new(state),
@@ -229,7 +191,7 @@ impl PassthroughFs {
 }
 
 impl FsState {
-	fn new(root: File, snapshots: Option<Arc<SnapshotPool>>, read_only: bool) -> io::Result<Self> {
+	fn new(root: File, read_only: bool) -> io::Result<Self> {
 		let metadata = root.metadata()?;
 		if !metadata.is_dir() {
 			return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -250,7 +212,6 @@ impl FsState {
 		identities.insert((metadata.dev(), metadata.ino()), ROOT_ID);
 		Ok(Self {
 			read_only,
-			snapshots,
 			nodes,
 			identities,
 			next_inode: ROOT_ID + 1,
@@ -954,78 +915,6 @@ impl FsState {
 		}
 	}
 
-	fn pool(&self) -> io::Result<&Arc<SnapshotPool>> {
-		self.snapshots
-			.as_ref()
-			.ok_or_else(|| io::Error::from_raw_os_error(libc::EOPNOTSUPP))
-	}
-
-	pub(crate) fn snapshot(&self) -> io::Result<u64> {
-		let pool = Arc::clone(self.pool()?);
-		let src = open_dir_fd(self.node(ROOT_ID)?.file.as_raw_fd(), c".")?;
-		let id = pool.allocate_id();
-		let name = snapshot_entry_name("snap", id);
-		clone_tree(&src, &pool.dir, &name)?;
-		Ok(id)
-	}
-
-	pub(crate) fn branch(&self, id: u64) -> io::Result<PassthroughFs> {
-		let pool = Arc::clone(self.pool()?);
-		let snap_name = snapshot_entry_name("snap", id);
-		let src = open_dir_fd(pool.dir.as_raw_fd(), &snap_name)?;
-		let work_id = pool.allocate_id();
-		let work_name = snapshot_entry_name("work", work_id);
-		clone_tree(&src, &pool.dir, &work_name)?;
-		let work_root = open_dir_fd(pool.dir.as_raw_fd(), &work_name)?;
-		let state = FsState::new(work_root, Some(pool), false)?;
-		Ok(PassthroughFs {
-			index: None,
-			state: RefCell::new(state),
-		})
-	}
-
-	pub(crate) fn restore(&mut self, id: u64) -> io::Result<()> {
-		self.writable()?;
-		let pool = Arc::clone(self.pool()?);
-		let snap_name = snapshot_entry_name("snap", id);
-		let src = open_dir_fd(pool.dir.as_raw_fd(), &snap_name)?;
-		let dst = open_dir_fd(self.node(ROOT_ID)?.file.as_raw_fd(), c".")?;
-		clear_dir_contents(&dst)?;
-		let mut hardlinks = HashMap::new();
-		clone_dir_contents(&src, &dst, &mut hardlinks)?;
-		copy_xattrs(&src, &dst)?;
-		let src_meta = src.metadata()?;
-		chmod(&dst, src_meta.mode() & 0o7777)?;
-		let root_node = self.nodes.remove(&ROOT_ID).expect("root node is present");
-		let root_meta = root_node.file.metadata()?;
-		self.nodes.clear();
-		self.identities.clear();
-		self.nodes.insert(
-			ROOT_ID,
-			Node {
-				file: root_node.file,
-				parent: ROOT_ID,
-				name: root_node.name,
-				lookups: 1,
-			},
-		);
-		self.identities
-			.insert((root_meta.dev(), root_meta.ino()), ROOT_ID);
-		Ok(())
-	}
-
-	pub(crate) fn delete_snapshot(&self, id: u64) -> io::Result<()> {
-		let pool = Arc::clone(self.pool()?);
-		let snap_name = snapshot_entry_name("snap", id);
-		remove_tree(&pool.dir, &snap_name)
-	}
-
-	fn snapshot_root(&self, id: u64) -> io::Result<File> {
-		let pool = Arc::clone(self.pool()?);
-		let snap_name = snapshot_entry_name("snap", id);
-		open_dir_fd(pool.dir.as_raw_fd(), &snap_name)
-	}
-
 	fn resolve_dir(&self, parts: &[CString]) -> io::Result<File> {
 		let mut dir = open_dir_fd(self.node(ROOT_ID)?.file.as_raw_fd(), c".")?;
 		for part in parts {
@@ -1636,41 +1525,42 @@ impl Fuse for PassthroughFs {
 	}
 }
 
-impl Snapshot for PassthroughFs {
-	type Id = u64;
-
-	async fn snapshot(&self) -> io::Result<u64> {
-		self.with(|state| state.snapshot())
-	}
-
-	async fn branch(&self, id: &u64) -> io::Result<Self> {
-		let mut branch = self.with(|state| state.branch(*id))?;
-		branch.index = self
-			.index
-			.as_ref()
-			.map(|i| Arc::new(SearchIndex::new(*i.options())));
-		Ok(branch)
-	}
-
-	async fn restore(&self, id: &u64) -> io::Result<()> {
-		async { self.with(|state| state.restore(*id)) }.await?;
-		if let Some(idx) = &self.index {
-			idx.notify_reset();
+impl FsState {
+	pub(crate) fn volume_clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
+		self.writable()?;
+		let src_parts = split_path(src)?;
+		let dst_parts = split_path(dst)?;
+		if src_parts.is_empty() || dst_parts.is_empty() {
+			return Err(io::Error::from_raw_os_error(libc::EINVAL));
 		}
-		Ok(())
-	}
-
-	async fn delete(&self, id: &u64) -> io::Result<()> {
-		self.with(|state| state.delete_snapshot(*id))
-	}
-
-	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
-		let snapshot = {
-			let state = self.state.borrow();
-			let root = state.snapshot_root(*id)?;
-			PassthroughFs::new(root, true)?
-		};
-		diff_volumes(&snapshot, self, scope).await
+		if dst_parts.starts_with(&src_parts) {
+			return Err(io::Error::from_raw_os_error(libc::EINVAL));
+		}
+		let (src_parent_parts, src_name) = src_parts.split_at(src_parts.len() - 1);
+		let (dst_parent_parts, dst_name) = dst_parts.split_at(dst_parts.len() - 1);
+		let src_parent = self.resolve_dir(src_parent_parts)?;
+		let dst_parent = self.resolve_dir(dst_parent_parts)?;
+		if inspect_name(dst_parent.as_raw_fd(), &dst_name[0]).is_ok() {
+			return Err(io::Error::from_raw_os_error(libc::EEXIST));
+		}
+		let child = inspect_name(src_parent.as_raw_fd(), &src_name[0])?;
+		let meta = child.metadata()?;
+		let file_type = meta.file_type();
+		if file_type.is_dir() {
+			let src_dir = open_dir_fd(src_parent.as_raw_fd(), &src_name[0])?;
+			clone_tree(&src_dir, &dst_parent, &dst_name[0])
+		} else {
+			let mut hardlinks = HashMap::new();
+			clone_entry(
+				&src_parent,
+				&src_name[0],
+				&dst_parent,
+				&dst_name[0],
+				&meta,
+				&child,
+				&mut hardlinks,
+			)
+		}
 	}
 }
 
@@ -1836,6 +1726,14 @@ impl Volume for PassthroughFs {
 			idx.persist_roots(self).await;
 		}
 		Ok(result)
+	}
+
+	async fn clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
+		async { self.with(|state| state.volume_clone_tree(src, dst)) }.await?;
+		if let Some(idx) = &self.index {
+			idx.notify_reset();
+		}
+		Ok(())
 	}
 }
 
@@ -2231,10 +2129,6 @@ unsafe extern "C" {
 	) -> libc::c_int;
 }
 
-fn snapshot_entry_name(prefix: &str, id: u64) -> CString {
-	CString::new(format!("{prefix}-{id}")).expect("formatted name has no NUL")
-}
-
 fn open_dir_fd(root: libc::c_int, name: &CStr) -> io::Result<File> {
 	open_cstr(
 		root,
@@ -2291,6 +2185,72 @@ fn list_dir_names(dir: &File) -> io::Result<Vec<CString>> {
 	}
 }
 
+fn clone_entry(
+	src: &File,
+	name: &CStr,
+	dst: &File,
+	dst_name: &CStr,
+	meta: &std::fs::Metadata,
+	child: &File,
+	hardlinks: &mut HashMap<(u64, u64), File>,
+) -> io::Result<()> {
+	let file_type = meta.file_type();
+	let identity = (meta.dev(), meta.ino());
+	if file_type.is_file()
+		&& meta.nlink() > 1
+		&& let Some(existing) = hardlinks.get(&identity)
+	{
+		link(existing, dst, dst_name)?;
+		return Ok(());
+	}
+	if !file_type.is_dir()
+		&& cvt(unsafe {
+			clonefileat(
+				src.as_raw_fd(),
+				name.as_ptr(),
+				dst.as_raw_fd(),
+				dst_name.as_ptr(),
+				CLONE_NOFOLLOW,
+			)
+		})
+		.is_ok()
+	{
+		if file_type.is_file() && meta.nlink() > 1 {
+			hardlinks.insert(identity, inspect_name(dst.as_raw_fd(), dst_name)?);
+		}
+		return Ok(());
+	}
+	if file_type.is_dir() {
+		mkdir(dst, dst_name, meta.mode() & 0o7777)?;
+		let child_src = open_dir_fd(src.as_raw_fd(), name)?;
+		let child_dst = open_dir_fd(dst.as_raw_fd(), dst_name)?;
+		clone_dir_contents(&child_src, &child_dst, hardlinks)?;
+		copy_xattrs(&child_src, &child_dst)?;
+		copy_dir_metadata(meta, &child_dst)?;
+	} else if file_type.is_file() {
+		let src_file = open_cstr(src.as_raw_fd(), name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?;
+		let dst_file = open_cstr(
+			dst.as_raw_fd(),
+			dst_name,
+			libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+			meta.mode() & 0o7777,
+		)?;
+		copy_file_fallback(&src_file, &dst_file, meta.size())?;
+		copy_xattrs(&src_file, &dst_file)?;
+		chmod(&dst_file, meta.mode() & 0o7777)?;
+		timestamps(&dst_file, meta_atime(meta), meta_mtime(meta))?;
+		if meta.nlink() > 1 {
+			hardlinks.insert(identity, inspect_name(dst.as_raw_fd(), dst_name)?);
+		}
+	} else if file_type.is_symlink() {
+		let target =
+			CString::new(read_link(child)?).map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+		symlink(&target, dst, dst_name)?;
+		symlink_timestamps(dst, dst_name, meta_atime(meta), meta_mtime(meta))?;
+	}
+	Ok(())
+}
+
 fn clone_dir_contents(
 	src: &File,
 	dst: &File,
@@ -2299,60 +2259,7 @@ fn clone_dir_contents(
 	for name in list_dir_names(src)? {
 		let child = inspect_name(src.as_raw_fd(), &name)?;
 		let meta = child.metadata()?;
-		let file_type = meta.file_type();
-		let identity = (meta.dev(), meta.ino());
-		if file_type.is_file()
-			&& meta.nlink() > 1
-			&& let Some(existing) = hardlinks.get(&identity)
-		{
-			link(existing, dst, &name)?;
-			continue;
-		}
-		if !file_type.is_dir()
-			&& cvt(unsafe {
-				clonefileat(
-					src.as_raw_fd(),
-					name.as_ptr(),
-					dst.as_raw_fd(),
-					name.as_ptr(),
-					CLONE_NOFOLLOW,
-				)
-			})
-			.is_ok()
-		{
-			if file_type.is_file() && meta.nlink() > 1 {
-				hardlinks.insert(identity, inspect_name(dst.as_raw_fd(), &name)?);
-			}
-			continue;
-		}
-		if file_type.is_dir() {
-			mkdir(dst, &name, meta.mode() & 0o7777)?;
-			let child_src = open_dir_fd(src.as_raw_fd(), &name)?;
-			let child_dst = open_dir_fd(dst.as_raw_fd(), &name)?;
-			clone_dir_contents(&child_src, &child_dst, hardlinks)?;
-			copy_xattrs(&child_src, &child_dst)?;
-			copy_dir_metadata(&meta, &child_dst)?;
-		} else if file_type.is_file() {
-			let src_file = open_cstr(src.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?;
-			let dst_file = open_cstr(
-				dst.as_raw_fd(),
-				&name,
-				libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-				meta.mode() & 0o7777,
-			)?;
-			copy_file_fallback(&src_file, &dst_file, meta.size())?;
-			copy_xattrs(&src_file, &dst_file)?;
-			chmod(&dst_file, meta.mode() & 0o7777)?;
-			timestamps(&dst_file, meta_atime(&meta), meta_mtime(&meta))?;
-			if meta.nlink() > 1 {
-				hardlinks.insert(identity, inspect_name(dst.as_raw_fd(), &name)?);
-			}
-		} else if file_type.is_symlink() {
-			let target = CString::new(read_link(&child)?)
-				.map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
-			symlink(&target, dst, &name)?;
-			symlink_timestamps(dst, &name, meta_atime(&meta), meta_mtime(&meta))?;
-		}
+		clone_entry(src, &name, dst, &name, &meta, &child, hardlinks)?;
 	}
 	Ok(())
 }

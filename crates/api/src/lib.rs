@@ -1,19 +1,19 @@
-//! [`Fuse`] transport operations, path-addressed [`Volume`] access, and
-//! [`Snapshot`] lifecycle and diff operations.
+//! [`Fuse`] transport operations, path-addressed [`Volume`] access,
+//! [`SubVolume`] scoping, and tree diffing.
 
+mod diff;
 mod fuse;
 mod memory;
 mod search;
-mod snapshot;
 mod volume;
 
+pub use diff::{DiffEntry, DiffKind, diff_trees, diff_volumes};
 pub use fuse::{
 	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Extent, Fuse, GetxattrReply, Kstatfs,
 	ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
 };
 pub use memory::{Memory, MemoryRange};
-pub use snapshot::{DiffEntry, DiffKind, Snapshot, diff_volumes};
-pub use volume::{Volume, WalkEntry, name_to_path};
+pub use volume::{SubVolume, Volume, WalkEntry, name_to_path};
 
 pub use search::{
 	ContentIndex, FileSignatures, FileStamp, IndexOptions, PageSig, PathIndex, SEARCH_OVERLAP,

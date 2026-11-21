@@ -2,7 +2,7 @@
 
 use std::ffi::CStr;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::fuse::{Attr, DirEntry, unsupported};
 
@@ -139,6 +139,263 @@ pub trait Volume {
 	/// copied.
 	async fn copy(&self, _from: &Path, _to: &Path) -> io::Result<u64> {
 		Err(unsupported())
+	}
+
+	/// Clones the file or directory tree at `src` to `dst` within the same
+	/// volume.
+	///
+	/// `dst` must not already exist, and its parent directory must exist.
+	/// Backends with native Copy-on-Write support (such as `JuiceFS` `Meta.Clone`,
+	/// `MemFs` structural sharing, or `reflink`) can clone without copying file
+	/// data blocks. Defaults to `ENOSYS`.
+	async fn clone_tree(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
+		Err(unsupported())
+	}
+}
+
+impl<V: Volume + ?Sized> Volume for &V {
+	async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+		(**self).getxattr(path, name).await
+	}
+
+	async fn setxattr(&self, path: &Path, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+		(**self).setxattr(path, name, value, flags).await
+	}
+
+	async fn removexattr(&self, path: &Path, name: &CStr) -> io::Result<()> {
+		(**self).removexattr(path, name).await
+	}
+
+	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+		(**self).read(path).await
+	}
+
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		(**self).read_range(path, offset, len).await
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		(**self).walk(root).await
+	}
+
+	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+		(**self).write(path, data).await
+	}
+
+	async fn stat(&self, path: &Path) -> io::Result<Attr> {
+		(**self).stat(path).await
+	}
+
+	async fn readlink(&self, path: &Path) -> io::Result<Vec<u8>> {
+		(**self).readlink(path).await
+	}
+
+	async fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+		(**self).symlink(target, link).await
+	}
+
+	async fn list(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+		(**self).list(path).await
+	}
+
+	async fn create_dir(&self, path: &Path) -> io::Result<()> {
+		(**self).create_dir(path).await
+	}
+
+	async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+		(**self).create_dir_all(path).await
+	}
+
+	async fn remove_file(&self, path: &Path) -> io::Result<()> {
+		(**self).remove_file(path).await
+	}
+
+	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
+		(**self).remove_dir(path).await
+	}
+
+	async fn remove_all(&self, path: &Path) -> io::Result<()> {
+		(**self).remove_all(path).await
+	}
+
+	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+		(**self).rename(from, to).await
+	}
+
+	async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+		(**self).copy(from, to).await
+	}
+
+	async fn clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
+		(**self).clone_tree(src, dst).await
+	}
+}
+
+/// A [`Volume`] view scoped to a subdirectory `root` of an underlying volume.
+///
+/// Paths passed to `SubVolume` are resolved relative to `root`; `..` components
+/// cannot escape above `root`.
+#[derive(Clone, Debug)]
+pub struct SubVolume<V> {
+	inner: V,
+	root: PathBuf,
+}
+
+impl<V> SubVolume<V> {
+	/// Creates a scoped view rooted at `root` within `inner`.
+	///
+	/// Rejects `root` paths that contain `..` escaping above the volume root.
+	pub fn new(inner: V, root: impl AsRef<Path>) -> io::Result<Self> {
+		let root = normalize_subpath(root.as_ref())?;
+		let rooted = if root.as_os_str().is_empty() {
+			PathBuf::from("/")
+		} else {
+			PathBuf::from("/").join(root)
+		};
+		Ok(Self {
+			inner,
+			root: rooted,
+		})
+	}
+
+	/// Returns a reference to the underlying volume.
+	pub fn inner(&self) -> &V {
+		&self.inner
+	}
+
+	/// Returns the root path within the underlying volume.
+	pub fn root(&self) -> &Path {
+		&self.root
+	}
+
+	fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
+		let rel = normalize_subpath(path)?;
+		if rel.as_os_str().is_empty() {
+			Ok(self.root.clone())
+		} else {
+			Ok(self.root.join(rel))
+		}
+	}
+}
+
+fn normalize_subpath(path: &Path) -> io::Result<PathBuf> {
+	let mut parts = Vec::new();
+	for component in path.components() {
+		match component {
+			Component::RootDir | Component::CurDir => {}
+			Component::ParentDir => {
+				if parts.pop().is_none() {
+					return Err(io::Error::from_raw_os_error(libc::EACCES));
+				}
+			}
+			Component::Normal(part) => parts.push(part),
+			Component::Prefix(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+		}
+	}
+	let mut out = PathBuf::new();
+	for part in parts {
+		out.push(part);
+	}
+	Ok(out)
+}
+
+impl<V: Volume> Volume for SubVolume<V> {
+	async fn getxattr(&self, path: &Path, name: &CStr) -> io::Result<Vec<u8>> {
+		let path = self.resolve(path)?;
+		self.inner.getxattr(&path, name).await
+	}
+
+	async fn setxattr(&self, path: &Path, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.setxattr(&path, name, value, flags).await
+	}
+
+	async fn removexattr(&self, path: &Path, name: &CStr) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.removexattr(&path, name).await
+	}
+
+	async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+		let path = self.resolve(path)?;
+		self.inner.read(&path).await
+	}
+
+	async fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+		let path = self.resolve(path)?;
+		self.inner.read_range(&path, offset, len).await
+	}
+
+	async fn walk(&self, root: &Path) -> io::Result<Vec<WalkEntry>> {
+		let root = self.resolve(root)?;
+		self.inner.walk(&root).await
+	}
+
+	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.write(&path, data).await
+	}
+
+	async fn stat(&self, path: &Path) -> io::Result<Attr> {
+		let path = self.resolve(path)?;
+		self.inner.stat(&path).await
+	}
+
+	async fn readlink(&self, path: &Path) -> io::Result<Vec<u8>> {
+		let path = self.resolve(path)?;
+		self.inner.readlink(&path).await
+	}
+
+	async fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+		let link = self.resolve(link)?;
+		self.inner.symlink(target, &link).await
+	}
+
+	async fn list(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+		let path = self.resolve(path)?;
+		self.inner.list(&path).await
+	}
+
+	async fn create_dir(&self, path: &Path) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.create_dir(&path).await
+	}
+
+	async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.create_dir_all(&path).await
+	}
+
+	async fn remove_file(&self, path: &Path) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.remove_file(&path).await
+	}
+
+	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.remove_dir(&path).await
+	}
+
+	async fn remove_all(&self, path: &Path) -> io::Result<()> {
+		let path = self.resolve(path)?;
+		self.inner.remove_all(&path).await
+	}
+
+	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+		let from = self.resolve(from)?;
+		let to = self.resolve(to)?;
+		self.inner.rename(&from, &to).await
+	}
+
+	async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+		let from = self.resolve(from)?;
+		let to = self.resolve(to)?;
+		self.inner.copy(&from, &to).await
+	}
+
+	async fn clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
+		let src = self.resolve(src)?;
+		let dst = self.resolve(dst)?;
+		self.inner.clone_tree(&src, &dst).await
 	}
 }
 

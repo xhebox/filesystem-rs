@@ -1,29 +1,25 @@
-//! An in-memory file system with structural-sharing Copy-on-Write snapshots.
+//! An in-memory file system with structural-sharing Copy-on-Write trees.
 //!
-//! [`MemFs`] implements [`api::Fuse`], [`api::Volume`], and [`api::Snapshot`]
+//! [`MemFs`] implements [`api::Fuse`] and [`api::Volume`]
 //! over persistent [`imbl`] trees:
 //!
-//! - The inode table is an [`imbl::HashMap`], so [`Snapshot::snapshot`],
-//!   [`Snapshot::branch`], and [`Snapshot::restore`] are $O(1)$ pointer clones.
-//! - Directories and extended attributes are [`imbl::OrdMap`]s, sharing
-//!   unchanged subtrees across snapshots.
+//! - The inode table is an [`imbl::HashMap`] and directories/extended attributes
+//!   are [`imbl::OrdMap`]s.
 //! - Regular file data is stored as an [`imbl::Vector`] of 4 KiB pages
 //!   (`Option<Arc<[u8; PAGE_SIZE]>>`, where `None` represents a sparse zero
-//!   page), so a small edit to a large file after a snapshot copies only the
-//!   touched 4 KiB pages.
+//!   page), so [`Volume::clone_tree`] shares all underlying file pages and a
+//!   small edit after cloning copies only the touched 4 KiB pages.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use api::{
-	Attr, Context, CreateArgs, DiffEntry, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply,
-	Kstatfs, ListxattrReply, Snapshot, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter,
-	diff_volumes, name_to_path,
+	Attr, Context, CreateArgs, DirEntry, DirentInfo, Entry, Fuse, GetxattrReply, Kstatfs,
+	ListxattrReply, Volume, WalkEntry, ZeroCopyReader, ZeroCopyWriter, name_to_path,
 };
 use api::{FileSignatures, IndexOptions, Search, SearchIndex};
 use imbl::{HashMap as ImHashMap, OrdMap, Vector};
@@ -184,30 +180,14 @@ struct OpenHandle {
 	directory: bool,
 }
 
-struct SnapshotStore {
-	snapshots: Mutex<ImHashMap<u64, TreeState>>,
-	next_id: AtomicU64,
-}
-
-impl SnapshotStore {
-	fn new() -> Self {
-		Self {
-			snapshots: Mutex::new(ImHashMap::new()),
-			next_id: AtomicU64::new(1),
-		}
-	}
-}
-
 struct FsState {
 	read_only: bool,
 	tree: TreeState,
 	handles: HashMap<Handle, OpenHandle>,
 	next_handle: Handle,
-	store: Arc<SnapshotStore>,
 }
 
-/// An in-memory file system with $O(1)$ Copy-on-Write snapshots and page-level
-/// data sharing.
+/// An in-memory file system with page-level Copy-on-Write data sharing.
 pub struct MemFs {
 	index: Option<Arc<SearchIndex>>,
 	state: RefCell<FsState>,
@@ -246,7 +226,6 @@ impl MemFs {
 				tree: TreeState::new(),
 				handles: HashMap::new(),
 				next_handle: 1,
-				store: Arc::new(SnapshotStore::new()),
 			}),
 		}
 	}
@@ -1788,64 +1767,21 @@ impl Volume for MemFs {
 		}
 		Ok(result)
 	}
-}
 
-impl Snapshot for MemFs {
-	type Id = u64;
-
-	async fn snapshot(&self) -> io::Result<u64> {
-		self.with(|state| {
-			let id = state.store.next_id.fetch_add(1, Ordering::Relaxed);
-			state
-				.store
-				.snapshots
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.insert(id, state.tree.clone());
-			Ok(id)
-		})
-	}
-
-	async fn branch(&self, id: &u64) -> io::Result<Self> {
-		self.with(|state| {
-			let tree = state
-				.store
-				.snapshots
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.get(id)
-				.cloned()
-				.ok_or_else(|| errno(libc::ENOENT))?;
-			Ok(Self {
-				index: self
-					.index
-					.as_ref()
-					.map(|i| Arc::new(SearchIndex::new(*i.options()))),
-				state: RefCell::new(FsState {
-					read_only: false,
-					tree,
-					handles: HashMap::new(),
-					next_handle: 1,
-					store: Arc::clone(&state.store),
-				}),
-			})
-		})
-	}
-
-	async fn restore(&self, id: &u64) -> io::Result<()> {
+	async fn clone_tree(&self, src: &Path, dst: &Path) -> io::Result<()> {
 		async {
 			self.with(|state| {
 				state.writable()?;
-				let tree = state
-					.store
-					.snapshots
-					.lock()
-					.unwrap_or_else(|e| e.into_inner())
-					.get(id)
-					.cloned()
-					.ok_or_else(|| errno(libc::ENOENT))?;
-				state.tree = tree;
-				Ok(())
+				let (src_parent, src_name) = state.resolve_parent(src)?;
+				let src_ino = state.lookup_child(src_parent, &src_name)?;
+				let (dst_parent, dst_name) = state.resolve_parent(dst)?;
+				if state.lookup_child(dst_parent, &dst_name).is_ok() {
+					return Err(errno(libc::EEXIST));
+				}
+				if state.is_ancestor(src_ino, dst_parent) {
+					return Err(errno(libc::EINVAL));
+				}
+				state.clone_subtree(src_ino, dst_parent, &dst_name)
 			})
 		}
 		.await?;
@@ -1854,45 +1790,49 @@ impl Snapshot for MemFs {
 		}
 		Ok(())
 	}
+}
 
-	async fn delete(&self, id: &u64) -> io::Result<()> {
-		self.with(|state| {
-			state
-				.store
-				.snapshots
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.remove(id)
-				.map(|_| ())
-				.ok_or_else(|| errno(libc::ENOENT))
-		})
-	}
+impl FsState {
+	fn clone_subtree(
+		&mut self,
+		src_ino: Inode,
+		dst_parent: Inode,
+		dst_name: &[u8],
+	) -> io::Result<()> {
+		let src_node = self.tree.node(src_ino)?.clone();
+		let new_ino = self.tree.allocate_inode()?;
+		let mut new_node = src_node.clone();
+		new_node.attr.ino = new_ino;
+		match &src_node.kind {
+			NodeKind::Dir { entries, .. } => {
+				new_node.kind = NodeKind::Dir {
+					parent: dst_parent,
+					entries: OrdMap::new(),
+				};
+				new_node.attr.nlink = 2;
+				self.tree.nodes.insert(new_ino, new_node);
+				let children: Vec<(Vec<u8>, Inode)> =
+					entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
+				for (child_name, child_ino) in children {
+					self.clone_subtree(child_ino, new_ino, &child_name)?;
+				}
+			}
+			NodeKind::File { .. } | NodeKind::Symlink { .. } => {
+				new_node.attr.nlink = 1;
+				self.tree.nodes.insert(new_ino, new_node);
+			}
+		}
 
-	async fn diff(&self, id: &u64, scope: &Path) -> io::Result<Vec<DiffEntry>> {
-		let snapshot = self.with(|state| {
-			let tree = state
-				.store
-				.snapshots
-				.lock()
-				.unwrap_or_else(|e| e.into_inner())
-				.get(id)
-				.cloned()
-				.ok_or_else(|| errno(libc::ENOENT))?;
-			Ok(Self {
-				index: self
-					.index
-					.as_ref()
-					.map(|i| Arc::new(SearchIndex::new(*i.options()))),
-				state: RefCell::new(FsState {
-					read_only: true,
-					tree,
-					handles: HashMap::new(),
-					next_handle: 1,
-					store: Arc::clone(&state.store),
-				}),
-			})
-		})?;
-		diff_volumes(&snapshot, self, scope).await
+		let parent = self.tree.node_mut(dst_parent)?;
+		let NodeKind::Dir { entries, .. } = &mut parent.kind else {
+			return Err(errno(libc::ENOTDIR));
+		};
+		entries.insert(dst_name.to_vec(), new_ino);
+		if src_node.is_dir() {
+			parent.attr.nlink += 1;
+		}
+		mark_modified(parent);
+		Ok(())
 	}
 }
 
@@ -2059,10 +1999,13 @@ mod tests {
 	}
 
 	#[test]
-	fn path_xattrs_and_indexed_search_snapshot() {
+	fn path_xattrs_and_indexed_search_clone_tree() {
 		let fs = MemFs::new(false).with_index(IndexOptions::default());
 		block_on(async {
-			let path = Path::new("/text");
+			Volume::create_dir_all(&fs, Path::new("/main"))
+				.await
+				.unwrap();
+			let path = Path::new("/main/text");
 			let mut data = b"padding padding\n".repeat(1600);
 			data.extend_from_slice(b"before Needle after\n");
 			Volume::write(&fs, path, &data).await.unwrap();
@@ -2081,9 +2024,11 @@ mod tests {
 				api::decode_sig_xattr(&attr, &raw),
 				Some(FileSignatures::compute(&data))
 			);
-			let id = fs.snapshot().await.unwrap();
+			Volume::clone_tree(&fs, Path::new("/main"), Path::new("/snap"))
+				.await
+				.unwrap();
 			let found = fs
-				.search(Path::new("/"), &api::SearchQuery::new("Needle"))
+				.search(Path::new("/main"), &api::SearchQuery::new("Needle"))
 				.await
 				.unwrap();
 			assert_eq!(found.len(), 1);
@@ -2091,24 +2036,25 @@ mod tests {
 			assert_eq!(found[0].line_text, "before Needle after");
 			Volume::write(&fs, path, b"replacement\n").await.unwrap();
 			assert!(
-				fs.search(Path::new("/"), &api::SearchQuery::new("Needle"))
+				fs.search(Path::new("/main"), &api::SearchQuery::new("Needle"))
 					.await
 					.unwrap()
 					.is_empty()
 			);
-			fs.restore(&id).await.unwrap();
+			let cloned_found = fs
+				.search(Path::new("/snap"), &api::SearchQuery::new("Needle"))
+				.await
+				.unwrap();
+			assert_eq!(cloned_found.len(), 1);
+			assert_eq!(cloned_found[0].line_text, "before Needle after");
+			let snap_attr = Volume::stat(&fs, Path::new("/snap/text")).await.unwrap();
+			let snap_raw = Volume::getxattr(&fs, Path::new("/snap/text"), XATTR_SIG_NAME)
+				.await
+				.unwrap();
 			assert_eq!(
-				Volume::getxattr(&fs, path, XATTR_SIG_NAME).await.unwrap(),
-				raw
+				api::decode_sig_xattr(&snap_attr, &snap_raw),
+				Some(FileSignatures::compute(&data))
 			);
-			assert_eq!(
-				fs.search(Path::new("/"), &api::SearchQuery::new("Needle"))
-					.await
-					.unwrap(),
-				found
-			);
-			let branch = fs.branch(&id).await.unwrap();
-			assert!(branch.search_index().is_some());
 		});
 	}
 
@@ -2180,12 +2126,12 @@ mod tests {
 
 	use std::future::Future;
 	use std::path::Path;
-	use std::sync::Arc;
+	use std::sync::{Arc, Mutex};
 	use std::task::{Context as TaskContext, Poll, Waker};
 
 	use api::{
-		Context, CreateArgs, DiffKind, Extent, Fuse, Memory, MemoryRange, Snapshot, Volume,
-		ZeroCopyReader, ZeroCopyWriter,
+		Context, CreateArgs, DiffKind, Extent, Fuse, Memory, MemoryRange, SubVolume, Volume,
+		ZeroCopyReader, ZeroCopyWriter, diff_trees, diff_volumes,
 	};
 
 	use super::*;
@@ -2263,32 +2209,40 @@ mod tests {
 	}
 
 	#[test]
-	fn volume_and_cow_snapshots_share_pages() {
+	fn volume_and_cow_clone_tree_share_pages() {
 		let fs = MemFs::new(false);
-		block_on(fs.create_dir_all(Path::new("/project/src"))).unwrap();
+		block_on(fs.create_dir_all(Path::new("/main/src"))).unwrap();
 
-		// Write an 8 KiB file (2 pages) and take a snapshot.
+		// Write an 8 KiB file (2 pages) and clone the tree.
 		let mut initial = vec![b'A'; PAGE_SIZE];
 		initial.extend_from_slice(&[b'B'; PAGE_SIZE]);
-		block_on(Volume::write(
-			&fs,
-			Path::new("/project/src/lib.rs"),
-			&initial,
-		))
-		.unwrap();
+		block_on(Volume::write(&fs, Path::new("/main/src/lib.rs"), &initial)).unwrap();
 		block_on(Volume::symlink(
 			&fs,
 			Path::new("src/lib.rs"),
-			Path::new("/project/current.rs"),
+			Path::new("/main/current.rs"),
 		))
 		.unwrap();
 
-		let snap1 = block_on(fs.snapshot()).unwrap();
+		block_on(Volume::clone_tree(
+			&fs,
+			Path::new("/main"),
+			Path::new("/feat"),
+		))
+		.unwrap();
+		assert!(
+			block_on(Volume::clone_tree(
+				&fs,
+				Path::new("/main"),
+				Path::new("/feat"),
+			))
+			.is_err()
+		);
 
-		// Modify only the second page in `fs`; the first page stays shared with `snap1`.
+		// Modify only the second page in `/main`; the first page stays shared with `/feat`.
 		let ctx = Context::default();
-		let proj = block_on(fs.lookup(&ctx, ROOT_ID, c"project")).unwrap();
-		let src = block_on(fs.lookup(&ctx, proj.inode, c"src")).unwrap();
+		let main = block_on(fs.lookup(&ctx, ROOT_ID, c"main")).unwrap();
+		let src = block_on(fs.lookup(&ctx, main.inode, c"src")).unwrap();
 		let file = block_on(fs.lookup(&ctx, src.inode, c"lib.rs")).unwrap();
 		let (fh, _) = block_on(fs.open(&ctx, file.inode, O_RDWR)).unwrap();
 		let mut writer = TestBuf::new(b"PATCHED".to_vec());
@@ -2304,7 +2258,11 @@ mod tests {
 		.unwrap();
 		block_on(fs.release(&ctx, file.inode, 0, fh)).unwrap();
 
-		// Verify page 0 pointer identity is still shared between live `fs` and `snap1`,
+		let feat = block_on(fs.lookup(&ctx, ROOT_ID, c"feat")).unwrap();
+		let feat_src = block_on(fs.lookup(&ctx, feat.inode, c"src")).unwrap();
+		let feat_file = block_on(fs.lookup(&ctx, feat_src.inode, c"lib.rs")).unwrap();
+
+		// Verify page 0 pointer identity is still shared between `/main` and `/feat`,
 		// while page 1 was CoW-cloned.
 		{
 			let state = fs.state.borrow();
@@ -2312,37 +2270,29 @@ mod tests {
 				NodeKind::File { pages } => pages.clone(),
 				_ => panic!("expected file"),
 			};
-			let snaps = state.store.snapshots.lock().unwrap();
-			let snap_pages = match &snaps.get(&snap1).unwrap().node(file.inode).unwrap().kind {
+			let clone_pages = match &state.tree.node(feat_file.inode).unwrap().kind {
 				NodeKind::File { pages } => pages.clone(),
 				_ => panic!("expected file"),
 			};
 			assert!(Arc::ptr_eq(
 				live_pages[0].as_ref().unwrap(),
-				snap_pages[0].as_ref().unwrap()
+				clone_pages[0].as_ref().unwrap()
 			));
 			assert!(!Arc::ptr_eq(
 				live_pages[1].as_ref().unwrap(),
-				snap_pages[1].as_ref().unwrap()
+				clone_pages[1].as_ref().unwrap()
 			));
 		}
 
-		// Branching from `snap1` yields the untouched original bytes.
-		let branched = block_on(fs.branch(&snap1)).unwrap();
+		// SubVolume scoped to `/feat` yields the untouched original bytes.
+		let feat_view = SubVolume::new(&fs, "/feat").unwrap();
 		assert_eq!(
-			block_on(Volume::read(&branched, Path::new("/project/src/lib.rs"))).unwrap(),
+			block_on(Volume::read(&feat_view, Path::new("/src/lib.rs"))).unwrap(),
 			initial
 		);
 
-		// Restore `fs` back to `snap1`.
-		block_on(fs.restore(&snap1)).unwrap();
-		assert_eq!(
-			block_on(Volume::read(&fs, Path::new("/project/src/lib.rs"))).unwrap(),
-			initial
-		);
-
-		block_on(fs.delete(&snap1)).unwrap();
-		assert!(block_on(fs.branch(&snap1)).is_err());
+		block_on(Volume::remove_all(&fs, Path::new("/feat"))).unwrap();
+		assert!(block_on(Volume::stat(&fs, Path::new("/feat"))).is_err());
 	}
 
 	#[test]
@@ -2466,36 +2416,57 @@ mod tests {
 	}
 
 	#[test]
-	fn snapshot_diff_reports_nested_changes_and_honours_scope() {
+	fn diff_trees_reports_nested_changes_and_honours_scope() {
 		let fs = MemFs::new(false);
-		block_on(fs.create_dir_all(Path::new("/sub"))).unwrap();
+		block_on(fs.create_dir_all(Path::new("/base/sub"))).unwrap();
 		for (path, data) in [
-			("/keep", b"keep".as_slice()),
-			("/edit", b"AAAA".as_slice()),
-			("/remove", b"gone".as_slice()),
-			("/kind", b"file".as_slice()),
-			("/sub/nested", b"one!".as_slice()),
-			("/sub/removed", b"old!".as_slice()),
+			("/base/keep", b"keep".as_slice()),
+			("/base/edit", b"AAAA".as_slice()),
+			("/base/remove", b"gone".as_slice()),
+			("/base/kind", b"file".as_slice()),
+			("/base/sub/nested", b"one!".as_slice()),
+			("/base/sub/removed", b"old!".as_slice()),
 		] {
 			block_on(Volume::write(&fs, Path::new(path), data)).unwrap();
 		}
-		block_on(Volume::symlink(&fs, Path::new("keep"), Path::new("/link"))).unwrap();
-		let snapshot = block_on(fs.snapshot()).unwrap();
+		block_on(Volume::symlink(
+			&fs,
+			Path::new("keep"),
+			Path::new("/base/link"),
+		))
+		.unwrap();
+		block_on(Volume::clone_tree(
+			&fs,
+			Path::new("/base"),
+			Path::new("/work"),
+		))
+		.unwrap();
 
 		// A same-length edit whose timestamps memfs never updates.
-		block_on(Volume::write(&fs, Path::new("/edit"), b"BBBB")).unwrap();
-		block_on(Volume::write(&fs, Path::new("/sub/nested"), b"two!")).unwrap();
-		block_on(Volume::write(&fs, Path::new("/add"), b"new")).unwrap();
-		block_on(Volume::write(&fs, Path::new("/sub/added"), b"new")).unwrap();
-		block_on(fs.remove_file(Path::new("/remove"))).unwrap();
-		block_on(fs.remove_file(Path::new("/sub/removed"))).unwrap();
-		block_on(fs.remove_file(Path::new("/kind"))).unwrap();
-		block_on(fs.create_dir(Path::new("/kind"))).unwrap();
-		block_on(Volume::write(&fs, Path::new("/kind/child"), b"x")).unwrap();
-		block_on(fs.remove_file(Path::new("/link"))).unwrap();
-		block_on(Volume::symlink(&fs, Path::new("add"), Path::new("/link"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/edit"), b"BBBB")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/sub/nested"), b"two!")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/add"), b"new")).unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/sub/added"), b"new")).unwrap();
+		block_on(fs.remove_file(Path::new("/work/remove"))).unwrap();
+		block_on(fs.remove_file(Path::new("/work/sub/removed"))).unwrap();
+		block_on(fs.remove_file(Path::new("/work/kind"))).unwrap();
+		block_on(fs.create_dir(Path::new("/work/kind"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/kind/child"), b"x")).unwrap();
+		block_on(fs.remove_file(Path::new("/work/link"))).unwrap();
+		block_on(Volume::symlink(
+			&fs,
+			Path::new("add"),
+			Path::new("/work/link"),
+		))
+		.unwrap();
 
-		let diff = block_on(fs.diff(&snapshot, Path::new("/"))).unwrap();
+		let diff = block_on(diff_trees(
+			&fs,
+			Path::new("/base"),
+			Path::new("/work"),
+			Path::new("/"),
+		))
+		.unwrap();
 		let changed: Vec<(PathBuf, DiffKind)> = diff
 			.into_iter()
 			.map(|entry| (entry.path, entry.kind))
@@ -2515,7 +2486,13 @@ mod tests {
 			]
 		);
 
-		let scoped = block_on(fs.diff(&snapshot, Path::new("sub"))).unwrap();
+		let scoped = block_on(diff_trees(
+			&fs,
+			Path::new("/base"),
+			Path::new("/work"),
+			Path::new("sub"),
+		))
+		.unwrap();
 		assert_eq!(
 			scoped
 				.into_iter()
@@ -2528,20 +2505,23 @@ mod tests {
 			]
 		);
 
-		// The snapshot remains unchanged.
-		let branched = block_on(fs.branch(&snapshot)).unwrap();
-		assert_eq!(
-			block_on(Volume::read(&branched, Path::new("/edit"))).unwrap(),
-			b"AAAA"
-		);
-		assert!(block_on(fs.diff(&snapshot, Path::new("/missing"))).is_err());
-		assert!(block_on(fs.diff(&999, Path::new("/"))).is_err());
-
-		block_on(fs.restore(&snapshot)).unwrap();
 		assert!(
-			block_on(fs.diff(&snapshot, Path::new("/")))
-				.unwrap()
-				.is_empty()
+			block_on(diff_trees(
+				&fs,
+				Path::new("/base"),
+				Path::new("/work"),
+				Path::new("/missing"),
+			))
+			.is_err()
+		);
+		assert!(
+			block_on(diff_trees(
+				&fs,
+				Path::new("/missing_a"),
+				Path::new("/missing_b"),
+				Path::new("/"),
+			))
+			.is_err()
 		);
 	}
 
@@ -2569,25 +2549,31 @@ mod tests {
 	#[test]
 	fn generic_listing_walk_and_diff_match_the_native_versions() {
 		let fs = MemFs::new(false);
-		block_on(fs.create_dir_all(Path::new("/a/b"))).unwrap();
-		block_on(Volume::write(&fs, Path::new("/a/b/file"), b"one")).unwrap();
-		block_on(Volume::symlink(&fs, Path::new("b"), Path::new("/a/link"))).unwrap();
-		let snapshot = block_on(fs.snapshot()).unwrap();
-		block_on(Volume::write(&fs, Path::new("/a/b/file"), b"two")).unwrap();
+		block_on(fs.create_dir_all(Path::new("/base/a/b"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/base/a/b/file"), b"one")).unwrap();
+		block_on(Volume::symlink(
+			&fs,
+			Path::new("b"),
+			Path::new("/base/a/link"),
+		))
+		.unwrap();
+		block_on(Volume::clone_tree(
+			&fs,
+			Path::new("/base"),
+			Path::new("/work"),
+		))
+		.unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/a/b/file"), b"two")).unwrap();
 
 		let listing = ListingOnly(&fs);
 		assert_eq!(
-			block_on(Volume::walk(&listing, Path::new("/"))).unwrap(),
-			block_on(Volume::walk(&fs, Path::new("/"))).unwrap()
+			block_on(Volume::walk(&listing, Path::new("/work"))).unwrap(),
+			block_on(Volume::walk(&fs, Path::new("/work"))).unwrap()
 		);
 
-		let snapshot_view = block_on(fs.branch(&snapshot)).unwrap();
-		let diff = block_on(diff_volumes(
-			&ListingOnly(&snapshot_view),
-			&listing,
-			Path::new("/"),
-		))
-		.unwrap();
+		let base_view = SubVolume::new(ListingOnly(&fs), "/base").unwrap();
+		let work_view = SubVolume::new(ListingOnly(&fs), "/work").unwrap();
+		let diff = block_on(diff_volumes(&base_view, &work_view, Path::new("/"))).unwrap();
 		assert_eq!(diff.len(), 1);
 		assert_eq!(diff[0].path, PathBuf::from("a/b/file"));
 		assert_eq!(diff[0].kind, DiffKind::Modified);
@@ -2622,47 +2608,31 @@ mod tests {
 	#[test]
 	fn diff_loops_over_partial_reads_and_rejects_premature_eof() {
 		let fs = MemFs::new(false);
-		block_on(Volume::write(&fs, Path::new("/file"), b"AAAA")).unwrap();
-		let snapshot = block_on(fs.snapshot()).unwrap();
-		let snapshot_view = block_on(fs.branch(&snapshot)).unwrap();
-
-		let unchanged = block_on(diff_volumes(
-			&PartialReads {
-				fs: &snapshot_view,
-				max: 1,
-			},
-			&PartialReads {
-				fs: &snapshot_view,
-				max: 1,
-			},
-			Path::new("/"),
+		block_on(fs.create_dir_all(Path::new("/base"))).unwrap();
+		block_on(Volume::write(&fs, Path::new("/base/file"), b"AAAA")).unwrap();
+		block_on(Volume::clone_tree(
+			&fs,
+			Path::new("/base"),
+			Path::new("/work"),
 		))
 		.unwrap();
+
+		let base_partial = SubVolume::new(PartialReads { fs: &fs, max: 1 }, "/base").unwrap();
+		let work_partial = SubVolume::new(PartialReads { fs: &fs, max: 1 }, "/work").unwrap();
+
+		let unchanged =
+			block_on(diff_volumes(&base_partial, &work_partial, Path::new("/"))).unwrap();
 		assert!(unchanged.is_empty());
 
-		block_on(Volume::write(&fs, Path::new("/file"), b"BBBB")).unwrap();
-		let changed = block_on(diff_volumes(
-			&PartialReads {
-				fs: &snapshot_view,
-				max: 1,
-			},
-			&PartialReads { fs: &fs, max: 1 },
-			Path::new("/"),
-		))
-		.unwrap();
+		block_on(Volume::write(&fs, Path::new("/work/file"), b"BBBB")).unwrap();
+		let changed = block_on(diff_volumes(&base_partial, &work_partial, Path::new("/"))).unwrap();
 		assert_eq!(changed.len(), 1);
 		assert_eq!(changed[0].path, PathBuf::from("file"));
 		assert_eq!(changed[0].kind, DiffKind::Modified);
 
-		let error = block_on(diff_volumes(
-			&PartialReads {
-				fs: &snapshot_view,
-				max: 0,
-			},
-			&PartialReads { fs: &fs, max: 0 },
-			Path::new("/"),
-		))
-		.unwrap_err();
+		let base_eof = SubVolume::new(PartialReads { fs: &fs, max: 0 }, "/base").unwrap();
+		let work_eof = SubVolume::new(PartialReads { fs: &fs, max: 0 }, "/work").unwrap();
+		let error = block_on(diff_volumes(&base_eof, &work_eof, Path::new("/"))).unwrap_err();
 		assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 	}
 

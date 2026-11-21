@@ -15,7 +15,7 @@ JuiceFS volume back-end for [`filesystem-rs`](https://github.com/xhebox/filesyst
 - Blocking calls into Go (object storage and metadata engine I/O) run on the session's plain worker threads and return via oneshot channels, keeping async device reactors unblocked and preventing Go threads from inheriting per-thread seccomp filters.
 - Dropping `Volume` closes the worker queues and unmounts the Go session.
 
-`Volume` implements `boxfs_api::Fuse`, `boxfs_api::Volume`, and `boxfs_api::Snapshot`.
+`Volume` implements `boxfs_api::Fuse` and `boxfs_api::Volume`.
 
 ## Linking the Go Archive
 
