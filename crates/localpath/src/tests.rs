@@ -1261,3 +1261,128 @@ fn search_root_snapshots_survive_restart_and_reconcile_only_offline_changes() {
 		assert_eq!(*counted.reads.borrow(), [PathBuf::from("/changed")]);
 	});
 }
+
+#[test]
+fn save_and_restore_across_relocated_roots_preserves_inodes_renames_and_handles() {
+	let scratch = Scratch::new();
+	let host_a = scratch.path().join("nfs-a");
+	let host_b = scratch.path().join("nfs-b");
+	fs::create_dir(&host_a).unwrap();
+	fs::create_dir(&host_b).unwrap();
+
+	let fs_a = filesystem(File::open(&host_a).unwrap(), false);
+	let ctx = Context::default();
+
+	let (saved, sub2_ino, file_ino, file_fh, dir_fh) = run(async {
+		let sub = fs_a.mkdir(&ctx, ROOT_ID, c"sub", 0o755, 0).await.unwrap();
+		let inner = fs_a
+			.mkdir(&ctx, sub.inode, c"inner", 0o755, 0)
+			.await
+			.unwrap();
+		let (created, fh, _) = fs_a
+			.create(
+				&ctx,
+				inner.inode,
+				c"draft.txt",
+				api::CreateArgs {
+					mode: 0o644,
+					umask: 0,
+					flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+				},
+			)
+			.await
+			.unwrap();
+		fs_a.state
+			.borrow()
+			.write(fh, 0, b"host-a-data")
+			.await
+			.unwrap();
+
+		// Rename top-level dir `sub` -> `renamed` (which must update `inner` and
+		// `draft.txt` paths!), then forget intermediate `inner` (`lookups` -> 0)
+		// while keeping `renamed` (`lookups` == 1) and `draft.txt` open!
+		Fuse::rename(&fs_a, &ctx, ROOT_ID, c"sub", ROOT_ID, c"renamed", 0)
+			.await
+			.unwrap();
+		let sub2 = fs_a.lookup(&ctx, ROOT_ID, c"renamed").await.unwrap();
+		fs_a.forget(&ctx, sub.inode, 1).await;
+		fs_a.forget(&ctx, inner.inode, 1).await;
+
+		let dir_fh = fs_a.opendir(&ctx, ROOT_ID).await.unwrap();
+		let state = fs_a.save_state().await.unwrap();
+		(state, sub2.inode, created.inode, fh, dir_fh)
+	});
+	drop(fs_a);
+
+	// Copy directory tree to `host_b` (completely fresh host `st_ino`s!).
+	fs::create_dir_all(host_b.join("renamed/inner")).unwrap();
+	fs::copy(
+		host_a.join("renamed/inner/draft.txt"),
+		host_b.join("renamed/inner/draft.txt"),
+	)
+	.unwrap();
+
+	let fs_b = filesystem(File::open(&host_b).unwrap(), false);
+	fs_b.restore_state(&saved).unwrap();
+
+	run(async {
+		// Old inode IDs and open handles continue working seamlessly on Host B.
+		let (attr, _) = fs_b.getattr(&ctx, file_ino, Some(file_fh)).await.unwrap();
+		assert_eq!(attr.ino, file_ino);
+		assert_eq!(attr.size, 11);
+
+		let mut buf = [0u8; 32];
+		let n = fs_b
+			.state
+			.borrow()
+			.read(file_fh, 0, &mut buf)
+			.await
+			.unwrap();
+		assert_eq!(&buf[..n], b"host-a-data");
+		fs_b.state
+			.borrow()
+			.write(file_fh, n as u64, b"+host-b")
+			.await
+			.unwrap();
+
+		let entries = fs_b.readdir(&ctx, ROOT_ID, dir_fh, 4096, 0).await.unwrap();
+		assert!(
+			entries
+				.iter()
+				.any(|e| e.name == b"renamed" && e.ino == sub2_ino)
+		);
+
+		fs_b.release(&ctx, file_ino, 0, file_fh).await.unwrap();
+		fs_b.releasedir(&ctx, ROOT_ID, dir_fh).await.unwrap();
+	});
+	assert_eq!(
+		fs::read(host_b.join("renamed/inner/draft.txt")).unwrap(),
+		b"host-a-data+host-b"
+	);
+}
+
+#[test]
+fn save_refuses_open_unlinked_file() {
+	let (_scratch, _host, root) = root();
+	let fs = filesystem(root, false);
+	let ctx = Context::default();
+
+	run(async {
+		let (_entry, _fh, _) = fs
+			.create(
+				&ctx,
+				ROOT_ID,
+				c"temp.txt",
+				api::CreateArgs {
+					mode: 0o600,
+					umask: 0,
+					flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+				},
+			)
+			.await
+			.unwrap();
+		fs.unlink(&ctx, ROOT_ID, c"temp.txt").await.unwrap();
+		let err = fs.save_state().await.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+	});
+}

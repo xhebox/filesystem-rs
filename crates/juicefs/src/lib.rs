@@ -79,6 +79,7 @@ pub struct Format {
 pub struct Volume {
 	index: Option<Arc<SearchIndex>>,
 	handle: usize,
+	writeback: bool,
 }
 
 struct DispatchedTask {
@@ -175,6 +176,11 @@ pub struct MountOptions<'a> {
 	/// Ignored when `read_only` or `no_bgjob` is `true`.
 	pub backup_meta: Duration,
 	pub backup_skip_trash: bool,
+
+	// --- Snapshot restore ---
+	/// Opaque bytes returned by [`Volume::save_state`] to adopt an existing
+	/// metadata session and restore its open FUSE handles across hosts.
+	pub restore_state: Option<&'a [u8]>,
 }
 
 impl Default for MountOptions<'_> {
@@ -214,6 +220,7 @@ impl Default for MountOptions<'_> {
 			put_timeout: Duration::from_secs(60),
 			backup_meta: Duration::ZERO,
 			backup_skip_trash: false,
+			restore_state: None,
 		}
 	}
 }
@@ -293,10 +300,17 @@ impl Volume {
 		let subdir = options.subdir.map(CString::new).transpose().map_err(|_| {
 			io::Error::new(io::ErrorKind::InvalidInput, "the subdirectory has a NUL")
 		})?;
+		let writeback = options.writeback;
+		let (restore_ptr, restore_len) = match options.restore_state {
+			Some(bytes) if !bytes.is_empty() => (bytes.as_ptr().cast::<c_char>(), bytes.len()),
+			_ => (std::ptr::null(), 0),
+		};
 		let duration_ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
 		let mut options = binding::juicefs_mount_options {
 			cache_dir: cache.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
 			subdir: subdir.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+			restore_state: restore_ptr,
+			restore_state_len: restore_len,
 			open_cache_ns: duration_ns(options.open_cache),
 			open_cache_limit: options.open_cache_limit,
 			heartbeat_ns: duration_ns(options.heartbeat),
@@ -343,7 +357,14 @@ impl Volume {
 		Ok(Volume {
 			handle,
 			index: None,
+			writeback,
 		})
+	}
+
+	/// Whether this volume uses client-side asynchronous writeback staging on
+	/// local disk, which cannot be migrated offline across hosts.
+	pub fn is_writeback(&self) -> bool {
+		self.writeback
 	}
 
 	/// Runs `f` against the session's handle on Go's bounded goroutine pool.
@@ -1042,6 +1063,32 @@ impl Volume {
 			};
 			if code == 0 {
 				return Ok(());
+			}
+			Err(io::Error::other(
+				String::from_utf8_lossy(&take_bytes(message)).into_owned(),
+			))
+		})
+		.await
+	}
+
+	/// Flushes all buffered data and metadata counters, exports the open-handle
+	/// table together with the metadata session ID, and marks the volume as
+	/// snapshotted so dropping it leaves the remote metadata session alive for
+	/// a restored [`Volume::mount`] (`MountOptions::restore_state`) to adopt.
+	pub async fn save_state(&self) -> io::Result<Vec<u8>> {
+		if self.writeback {
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"cannot snapshot a juicefs volume with client writeback cache enabled",
+			));
+		}
+		self.call(move |handle| {
+			let mut out = 0usize;
+			let mut message = 0usize;
+			// SAFETY: `out` and `message` are valid out-pointers for Go bytes handles.
+			let code = unsafe { binding::juicefs_save_state(handle, &mut out, &mut message) };
+			if code == 0 {
+				return Ok(take_bytes(out));
 			}
 			Err(io::Error::other(
 				String::from_utf8_lossy(&take_bytes(message)).into_owned(),

@@ -62,6 +62,7 @@ const NO_CACHE: Timeout = (0, 0);
 type Timeout = (u64, u32);
 
 const FILE_TYPE_MASK: u32 = libc::S_IFMT;
+const RENAME_EXCHANGE: u32 = 2;
 const REGULAR_FILE: u32 = libc::S_IFREG;
 const O_PATH: i32 = 0o10_000_000;
 const RESOLVE: Resolve = Resolve::BENEATH.union(Resolve::NO_SYMLINKS);
@@ -72,13 +73,18 @@ type Handle = u64;
 /// A confined handle plus the locator needed to re-derive it by name.
 struct Node {
 	file: File,
+	path: Vec<CString>,
 	parent: Inode,
 	name: CString,
 	lookups: u64,
 }
 
 enum Resource {
-	File(completion::File),
+	File {
+		file: completion::File,
+		inode: Inode,
+		flags: u32,
+	},
 	Dir {
 		file: completion::File,
 		inode: Inode,
@@ -168,12 +174,28 @@ impl PassthroughFs {
 	/// the caller awaits its I/O: another request runs in the meantime.
 	fn open_file(&self, handle: Handle) -> io::Result<completion::File> {
 		match self.state.borrow().handles.get(&handle) {
-			Some(Resource::File(file) | Resource::Dir { file, .. }) => Ok(file.clone()),
+			Some(Resource::File { file, .. } | Resource::Dir { file, .. }) => Ok(file.clone()),
 			None => {
 				log::warn!("io on unknown handle={handle}");
 				Err(io::Error::from_raw_os_error(libc::EBADF))
 			}
 		}
+	}
+
+	/// Flushes all writable open handles and serializes the cached inode and
+	/// open-handle tables for offline snapshot migration across hosts.
+	pub async fn save_state(&self) -> io::Result<Vec<u8>> {
+		let dirty = self.with(|state| Ok(state.writable_files()))?;
+		for file in dirty {
+			file.sync().await.map_err(engine_io)?;
+		}
+		self.with(|state| state.export_state())
+	}
+
+	/// Restores cached inodes and reopens handles saved by [`Self::save_state`]
+	/// against this instance's confined root directory.
+	pub fn restore_state(&self, bytes: &[u8]) -> io::Result<()> {
+		self.with(|state| state.import_state(bytes))
 	}
 
 	pub(crate) fn with<R>(&self, f: impl FnOnce(&mut FsState) -> io::Result<R>) -> io::Result<R> {
@@ -197,6 +219,7 @@ impl FsState {
 			ROOT_ID,
 			Node {
 				file: root_node,
+				path: Vec::new(),
 				parent: ROOT_ID,
 				name: CString::new(".").expect("`.` has no NUL"),
 				lookups: 1,
@@ -233,6 +256,9 @@ impl FsState {
 			node.lookups = node.lookups.saturating_add(lookups);
 			return Ok((inode, metadata));
 		}
+		let mut path = self.node(parent)?.path.clone();
+		let cname = CString::from(name);
+		path.push(cname.clone());
 		let inode = self.next_inode;
 		self.next_inode = self
 			.next_inode
@@ -242,8 +268,9 @@ impl FsState {
 			inode,
 			Node {
 				file,
+				path,
 				parent,
-				name: CString::from(name),
+				name: cname,
 				lookups,
 			},
 		);
@@ -327,8 +354,27 @@ impl FsState {
 			x if x == libc::O_RDWR as u32 => libc::O_RDWR,
 			_ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
 		};
-		let parent = self.node(node.parent)?;
-		reopen(&node.file, parent.file.as_raw_fd(), &node.name, open_flags)
+		if let Some(parent) = self.nodes.get(&node.parent) {
+			return reopen(&node.file, parent.file.as_raw_fd(), &node.name, open_flags);
+		}
+		if node.path.is_empty() {
+			return reopen(
+				&node.file,
+				self.node(ROOT_ID)?.file.as_raw_fd(),
+				&node.name,
+				open_flags,
+			);
+		}
+		let parent_dir = self.resolve_components(&node.path[..node.path.len() - 1])?;
+		reopen(&node.file, parent_dir.as_raw_fd(), &node.name, open_flags)
+	}
+
+	fn resolve_components(&self, parts: &[CString]) -> io::Result<File> {
+		let mut current = inspect(self.node(ROOT_ID)?.file.as_raw_fd(), Path::new("."))?;
+		for part in parts {
+			current = inspect_name(current.as_raw_fd(), part)?;
+		}
+		Ok(current)
 	}
 
 	fn create_resource(
@@ -528,7 +574,13 @@ impl FsState {
 
 	pub(crate) fn open(&mut self, _: &Context, inode: Inode, flags: u32) -> io::Result<Handle> {
 		let file = self.open_resource(inode, flags, false)?;
-		let handle = self.allocate_handle(Resource::File(completion::File::new(file)))?;
+		let clean_flags =
+			flags & !(libc::O_CREAT as u32 | libc::O_EXCL as u32 | libc::O_TRUNC as u32);
+		let handle = self.allocate_handle(Resource::File {
+			file: completion::File::new(file),
+			inode,
+			flags: clean_flags,
+		})?;
 		log::debug!("backend open inode={inode} flags={flags} handle={handle}");
 		Ok(handle)
 	}
@@ -548,7 +600,13 @@ impl FsState {
 		if metadata.dev() != inspected.dev() || metadata.ino() != inspected.ino() {
 			return Err(stale());
 		}
-		let handle = self.allocate_handle(Resource::File(completion::File::new(file)))?;
+		let clean_flags =
+			flags & !(libc::O_CREAT as u32 | libc::O_EXCL as u32 | libc::O_TRUNC as u32);
+		let handle = self.allocate_handle(Resource::File {
+			file: completion::File::new(file),
+			inode,
+			flags: clean_flags,
+		})?;
 		let name = String::from_utf8_lossy(name.to_bytes());
 		log::debug!("backend create parent={parent} name={name} flags={flags} handle={handle}");
 		Ok((self.entry(inode, &metadata), handle))
@@ -625,7 +683,55 @@ impl FsState {
 			self.parent_file(new_parent)?,
 			new_name,
 			flags,
-		)
+		)?;
+		self.retrack_rename(
+			old_parent,
+			old_name,
+			new_parent,
+			new_name,
+			flags & RENAME_EXCHANGE != 0,
+		);
+		Ok(())
+	}
+
+	fn retrack_rename(
+		&mut self,
+		old_parent: Inode,
+		old_name: &CStr,
+		new_parent: Inode,
+		new_name: &CStr,
+		exchange: bool,
+	) {
+		let (Some(old_p), Some(new_p)) = (self.nodes.get(&old_parent), self.nodes.get(&new_parent))
+		else {
+			return;
+		};
+		let mut old_path = old_p.path.clone();
+		old_path.push(CString::from(old_name));
+		let mut new_path = new_p.path.clone();
+		new_path.push(CString::from(new_name));
+		if old_path == new_path {
+			return;
+		}
+		for node in self.nodes.values_mut() {
+			if node.path.starts_with(&old_path) {
+				let tail = node.path.split_off(old_path.len());
+				if tail.is_empty() {
+					node.parent = new_parent;
+					node.name = CString::from(new_name);
+				}
+				node.path = new_path.clone();
+				node.path.extend(tail);
+			} else if exchange && node.path.starts_with(&new_path) {
+				let tail = node.path.split_off(new_path.len());
+				if tail.is_empty() {
+					node.parent = old_parent;
+					node.name = CString::from(old_name);
+				}
+				node.path = old_path.clone();
+				node.path.extend(tail);
+			}
+		}
 	}
 
 	pub(crate) fn link(
@@ -666,7 +772,7 @@ impl FsState {
 		out: &mut [u8],
 	) -> io::Result<usize> {
 		let file = match self.handles.get(&handle) {
-			Some(Resource::File(file)) => file.clone(),
+			Some(Resource::File { file, .. }) => file.clone(),
 			_ => {
 				log::warn!("backend read on unknown handle={handle}");
 				return Err(io::Error::from_raw_os_error(libc::EBADF));
@@ -694,7 +800,7 @@ impl FsState {
 			return Err(io::Error::from_raw_os_error(libc::EROFS));
 		}
 		let file = match self.handles.get(&handle) {
-			Some(Resource::File(file)) => file.clone(),
+			Some(Resource::File { file, .. }) => file.clone(),
 			_ => {
 				log::warn!("backend write on unknown handle={handle}");
 				return Err(io::Error::from_raw_os_error(libc::EBADF));
@@ -711,7 +817,7 @@ impl FsState {
 
 	pub(crate) fn release(&mut self, handle: Handle) -> io::Result<()> {
 		match self.handles.remove(&handle) {
-			Some(Resource::File(_)) => Ok(()),
+			Some(Resource::File { .. }) => Ok(()),
 			Some(resource) => {
 				self.handles.insert(handle, resource);
 				log::warn!("release on a non-file resource handle={handle}");
@@ -730,7 +836,7 @@ impl FsState {
 	/// `EBADF`.
 	fn flush_file(&self, handle: Handle) -> io::Result<completion::File> {
 		match self.handles.get(&handle) {
-			Some(Resource::File(file)) => Ok(file.clone()),
+			Some(Resource::File { file, .. }) => Ok(file.clone()),
 			_ => Err(io::Error::from_raw_os_error(libc::EBADF)),
 		}
 	}
@@ -739,10 +845,226 @@ impl FsState {
 	/// state borrow.
 	fn sync_file(&self, handle: Handle, directory: bool) -> io::Result<completion::File> {
 		match (directory, self.handles.get(&handle)) {
-			(false, Some(Resource::File(file))) => Ok(file.clone()),
+			(false, Some(Resource::File { file, .. })) => Ok(file.clone()),
 			(true, Some(Resource::Dir { file, .. })) => Ok(file.clone()),
 			_ => Err(io::Error::from_raw_os_error(libc::EBADF)),
 		}
+	}
+
+	fn writable_files(&self) -> Vec<completion::File> {
+		self.handles
+			.values()
+			.filter_map(|res| match res {
+				Resource::File { file, flags, .. }
+					if (*flags & libc::O_ACCMODE as u32) != libc::O_RDONLY as u32 =>
+				{
+					Some(file.clone())
+				}
+				_ => None,
+			})
+			.collect()
+	}
+
+	fn export_state(&self) -> io::Result<Vec<u8>> {
+		use crate::state::{SavedHandle, SavedNode, SavedState, encode};
+
+		for res in self.handles.values() {
+			let inode = match res {
+				Resource::File { inode, .. } | Resource::Dir { inode, .. } => *inode,
+			};
+			if inode == ROOT_ID {
+				continue;
+			}
+			let node = self.nodes.get(&inode).ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::Unsupported,
+					"cannot snapshot passthrough volume with an open forgotten inode",
+				)
+			})?;
+			let resolved = self.resolve_components(&node.path).map_err(|_| {
+				io::Error::new(
+					io::ErrorKind::Unsupported,
+					"cannot snapshot passthrough volume with an open unlinked file",
+				)
+			})?;
+			let pinned_meta = node.file.metadata()?;
+			let current_meta = resolved.metadata()?;
+			if pinned_meta.dev() != current_meta.dev() || pinned_meta.ino() != current_meta.ino() {
+				return Err(io::Error::new(
+					io::ErrorKind::Unsupported,
+					"cannot snapshot passthrough volume with a replaced open file",
+				));
+			}
+		}
+
+		let mut nodes = Vec::with_capacity(self.nodes.len().saturating_sub(1));
+		for (&id, node) in &self.nodes {
+			if id == ROOT_ID {
+				continue;
+			}
+			let meta = node.file.metadata()?;
+			nodes.push(SavedNode {
+				id,
+				parent: node.parent,
+				lookups: node.lookups,
+				file_type: meta.mode() & FILE_TYPE_MASK,
+				path: node.path.iter().map(|c| c.as_bytes().to_vec()).collect(),
+			});
+		}
+		nodes.sort_by_key(|n| (n.path.len(), n.id));
+
+		let mut handles = Vec::with_capacity(self.handles.len());
+		for (&handle, res) in &self.handles {
+			match res {
+				Resource::File { inode, flags, .. } => handles.push(SavedHandle {
+					handle,
+					inode: *inode,
+					is_dir: false,
+					flags: *flags,
+				}),
+				Resource::Dir { inode, .. } => handles.push(SavedHandle {
+					handle,
+					inode: *inode,
+					is_dir: true,
+					flags: libc::O_RDONLY as u32,
+				}),
+			}
+		}
+		handles.sort_by_key(|h| h.handle);
+
+		encode(&SavedState {
+			next_inode: self.next_inode,
+			next_handle: self.next_handle,
+			nodes,
+			handles,
+		})
+	}
+
+	fn import_state(&mut self, bytes: &[u8]) -> io::Result<()> {
+		use std::collections::HashSet;
+
+		let saved = crate::state::decode(bytes)?;
+		if saved.next_inode <= ROOT_ID {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"saved next_inode must exceed ROOT_ID",
+			));
+		}
+
+		let needed_inodes: HashSet<Inode> = saved.handles.iter().map(|h| h.inode).collect();
+		let root_file = inspect(self.node(ROOT_ID)?.file.as_raw_fd(), Path::new("."))?;
+		let root_meta = root_file.metadata()?;
+
+		let mut nodes = HashMap::with_capacity(saved.nodes.len() + 1);
+		let mut identities = HashMap::with_capacity(saved.nodes.len() + 1);
+		nodes.insert(
+			ROOT_ID,
+			Node {
+				file: root_file,
+				path: Vec::new(),
+				parent: ROOT_ID,
+				name: CString::new(".").expect("`.` has no NUL"),
+				lookups: 1,
+			},
+		);
+		identities.insert((root_meta.dev(), root_meta.ino()), ROOT_ID);
+
+		for sn in saved.nodes {
+			if sn.id == ROOT_ID || sn.id >= saved.next_inode || nodes.contains_key(&sn.id) {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"invalid saved inode id",
+				));
+			}
+			let mut cpath = Vec::with_capacity(sn.path.len());
+			for comp in &sn.path {
+				validate_component(comp)?;
+				let cs = CString::new(comp.as_slice()).map_err(|_| {
+					io::Error::new(io::ErrorKind::InvalidData, "saved path component has NUL")
+				})?;
+				cpath.push(cs);
+			}
+			let mut cur = inspect(nodes[&ROOT_ID].file.as_raw_fd(), Path::new("."))?;
+			let mut missing = false;
+			for comp in &cpath {
+				match inspect_name(cur.as_raw_fd(), comp) {
+					Ok(next) => cur = next,
+					Err(err)
+						if err.kind() == io::ErrorKind::NotFound
+							&& !needed_inodes.contains(&sn.id) =>
+					{
+						missing = true;
+						break;
+					}
+					Err(err) => return Err(err),
+				}
+			}
+			if missing {
+				continue;
+			}
+			let meta = cur.metadata()?;
+			if (meta.mode() & FILE_TYPE_MASK) != sn.file_type {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"restored inode changed file type on target host",
+				));
+			}
+			let name = cpath.last().expect("non-empty path").clone();
+			identities.insert((meta.dev(), meta.ino()), sn.id);
+			nodes.insert(
+				sn.id,
+				Node {
+					file: cur,
+					path: cpath,
+					parent: sn.parent,
+					name,
+					lookups: sn.lookups.max(1),
+				},
+			);
+		}
+
+		self.nodes = nodes;
+		self.identities = identities;
+		self.next_inode = saved.next_inode;
+		self.handles.clear();
+		self.next_handle = saved.next_handle.max(1);
+
+		for sh in saved.handles {
+			if sh.handle == 0
+				|| sh.handle >= self.next_handle
+				|| self.handles.contains_key(&sh.handle)
+			{
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"invalid saved handle id",
+				));
+			}
+			if sh.is_dir {
+				let file = self.open_resource(sh.inode, libc::O_RDONLY as u32, true)?;
+				let cursor = DirCursor::new(&file)?;
+				self.handles.insert(
+					sh.handle,
+					Resource::Dir {
+						file: completion::File::new(file),
+						inode: sh.inode,
+						cursor,
+					},
+				);
+			} else {
+				let clean_flags =
+					sh.flags & !(libc::O_CREAT as u32 | libc::O_EXCL as u32 | libc::O_TRUNC as u32);
+				let file = self.open_resource(sh.inode, clean_flags, false)?;
+				self.handles.insert(
+					sh.handle,
+					Resource::File {
+						file: completion::File::new(file),
+						inode: sh.inode,
+						flags: clean_flags,
+					},
+				);
+			}
+		}
+		Ok(())
 	}
 
 	pub(crate) fn access(&mut self, context: &Context, inode: Inode, mask: u32) -> io::Result<()> {

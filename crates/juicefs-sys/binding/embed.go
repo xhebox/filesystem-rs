@@ -67,6 +67,8 @@ typedef struct {
 typedef struct {
 	const char *cache_dir;
 	const char *subdir;
+	const char *restore_state;
+	size_t restore_state_len;
 
 	uint64_t open_cache_ns;
 	uint64_t open_cache_limit;
@@ -114,6 +116,8 @@ static inline void juicefs_call_task(juicefs_task_fn fn, void *arg) {
 import "C"
 
 import (
+	"encoding/json"
+	"os"
 	"path"
 	"runtime/cgo"
 	"sync"
@@ -140,13 +144,14 @@ type dispatchTask struct {
 
 // One mounted volume. The VFS tracks its own inodes and handles.
 type session struct {
-	v       *vfs.VFS
-	blob    object.ObjectStorage
-	mu      sync.RWMutex
-	closing atomic.Bool
-	jobs    chan dispatchTask
-	lockSem chan struct{}
-	wg      sync.WaitGroup
+	v           *vfs.VFS
+	blob        object.ObjectStorage
+	mu          sync.RWMutex
+	closing     atomic.Bool
+	snapshotted atomic.Bool
+	jobs        chan dispatchTask
+	lockSem     chan struct{}
+	wg          sync.WaitGroup
 }
 
 func newSession(v *vfs.VFS, blob object.ObjectStorage) *session {
@@ -236,6 +241,11 @@ func juicefs_mount(payload *C.char, options *C.juicefs_mount_options, err *C.uin
 			backupMeta:        time.Duration(options.backup_meta_ns),
 			backupSkipTrash:   options.backup_skip_trash != 0,
 		}
+		if options.restore_state != nil && options.restore_state_len > 0 {
+			raw := unsafe.Slice((*byte)(unsafe.Pointer(options.restore_state)), int(options.restore_state_len))
+			opts.restoreState = make([]byte, len(raw))
+			copy(opts.restoreState, raw)
+		}
 	}
 	v, blob, mountErr := buildVFS(C.GoString(payload), opts)
 	if mountErr != nil {
@@ -302,7 +312,11 @@ func juicefs_unmount(h C.uintptr_t) {
 		s.wg.Wait()
 		if s.v != nil {
 			_ = s.v.FlushAll("")
-			_ = s.v.Meta.CloseSession()
+			if s.snapshotted.Load() {
+				s.v.Meta.FlushSession()
+			} else {
+				_ = s.v.Meta.CloseSession()
+			}
 			_ = s.v.Meta.Shutdown()
 		}
 		if s.blob != nil {
@@ -711,6 +725,65 @@ func juicefs_flush_all(h C.uintptr_t, path *C.char, message *C.uintptr_t) (ret C
 		*message = newBytes([]byte(err.Error()))
 		return 1
 	}
+	return 0
+}
+
+// juicefs_save_state flushes all dirty buffers and metadata session counters,
+// serializes the open-handle table together with the metadata session ID into
+// `out` (a bytes handle), and marks the session as snapshotted so a subsequent
+// `juicefs_unmount` leaves the remote metadata session alive for the restored
+// instance to adopt. Returns 0 on success, or nonzero with `message` set.
+//
+//export juicefs_save_state
+func juicefs_save_state(h C.uintptr_t, out *C.uintptr_t, message *C.uintptr_t) (ret C.int) {
+	defer recoverErr(&ret)
+	s := lookup(h)
+	if s == nil {
+		*message = newBytes([]byte("the volume is not mounted"))
+		return 1
+	}
+	if s.v.Conf != nil && s.v.Conf.Chunk != nil && s.v.Conf.Chunk.Writeback {
+		*message = newBytes([]byte("cannot snapshot a juicefs volume with client writeback cache enabled"))
+		return 1
+	}
+	cacheDir := ""
+	if s.v.Conf != nil && s.v.Conf.Chunk != nil {
+		cacheDir = s.v.Conf.Chunk.CacheDir
+	}
+	tmpFile, err := createTempStateFile(cacheDir)
+	if err != nil {
+		*message = newBytes([]byte("create temporary state file: " + err.Error()))
+		return 1
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := s.v.FlushAll(tmpPath); err != nil {
+		*message = newBytes([]byte("flush volume state: " + err.Error()))
+		return 1
+	}
+	vfsBytes, err := os.ReadFile(tmpPath)
+	if err != nil {
+		*message = newBytes([]byte("read dumped handle state: " + err.Error()))
+		return 1
+	}
+	s.v.Meta.FlushSession()
+	var sid uint64
+	if s.v.Conf != nil && s.v.Conf.Meta != nil {
+		sid = s.v.Conf.Meta.Sid
+	}
+	encoded, err := json.Marshal(snapshotEnvelope{
+		Version:  snapshotVersion,
+		Sid:      sid,
+		VfsState: vfsBytes,
+	})
+	if err != nil {
+		*message = newBytes([]byte("encode snapshot envelope: " + err.Error()))
+		return 1
+	}
+	s.snapshotted.Store(true)
+	*out = newBytes(encoded)
 	return 0
 }
 

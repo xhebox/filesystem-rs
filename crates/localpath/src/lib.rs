@@ -18,6 +18,7 @@
 
 mod abi;
 mod span;
+mod state;
 
 std::cfg_select! {
 	any(target_os = "linux", target_os = "android") => {
