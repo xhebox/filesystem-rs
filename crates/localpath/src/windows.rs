@@ -123,7 +123,11 @@ struct RawDirEntry {
 }
 
 enum Resource {
-	File(completion::File),
+	File {
+		file: completion::File,
+		inode: Inode,
+		flags: u32,
+	},
 	Dir {
 		inode: Inode,
 		entries: Vec<OsString>,
@@ -173,9 +177,25 @@ impl PassthroughFs {
 
 	fn open_file(&self, handle: Handle) -> io::Result<completion::File> {
 		match self.state.borrow().handles.get(&handle) {
-			Some(Resource::File(file)) => Ok(file.clone()),
+			Some(Resource::File { file, .. }) => Ok(file.clone()),
 			_ => Err(errno(libc::EBADF)),
 		}
+	}
+
+	/// Flushes all writable open handles and serializes the cached inode and
+	/// open-handle tables for offline snapshot migration across hosts.
+	pub async fn save_state(&self) -> io::Result<Vec<u8>> {
+		let dirty = self.with(|state| Ok(state.writable_files()))?;
+		for file in dirty {
+			file.sync().await.map_err(engine_io)?;
+		}
+		self.with(|state| state.export_state())
+	}
+
+	/// Restores cached inodes and reopens handles saved by [`Self::save_state`]
+	/// against this instance's confined root directory.
+	pub fn restore_state(&self, bytes: &[u8]) -> io::Result<()> {
+		self.with(|state| state.import_state(bytes))
 	}
 
 	pub(crate) fn with<R>(&self, f: impl FnOnce(&mut FsState) -> io::Result<R>) -> io::Result<R> {
@@ -431,7 +451,12 @@ impl FsState {
 			return Err(errno(libc::EROFS));
 		}
 		let file = self.reopen(inode, write, flags & O_APPEND != 0, flags & O_TRUNC != 0)?;
-		self.allocate_handle(Resource::File(completion::File::new(file)))
+		let clean_flags = flags & !(O_EXCL | O_TRUNC);
+		self.allocate_handle(Resource::File {
+			file: completion::File::new(file),
+			inode,
+			flags: clean_flags,
+		})
 	}
 
 	fn create(
@@ -461,7 +486,12 @@ impl FsState {
 		}
 		let (inode, metadata) = self.lookup_child(parent, name.to_bytes())?;
 		let entry = self.entry(inode, &metadata)?;
-		let handle = self.allocate_handle(Resource::File(completion::File::new(file)))?;
+		let clean_flags = (flags & !(O_EXCL | O_TRUNC | O_ACCMODE)) | O_RDWR;
+		let handle = self.allocate_handle(Resource::File {
+			file: completion::File::new(file),
+			inode,
+			flags: clean_flags,
+		})?;
 		Ok((entry, handle))
 	}
 
@@ -525,11 +555,26 @@ impl FsState {
 			return Err(errno(libc::EINVAL));
 		}
 		let (_, old_path) = self.child_path(old_parent, old_name.to_bytes())?;
-		let (_, new_path) = self.child_path(new_parent, new_name.to_bytes())?;
+		let (new_os, new_path) = self.child_path(new_parent, new_name.to_bytes())?;
 		if flags & RENAME_NOREPLACE != 0 && new_path.symlink_metadata().is_ok() {
 			return Err(errno(libc::EEXIST));
 		}
-		fs::rename(old_path, new_path)
+		fs::rename(&old_path, &new_path)?;
+		if old_path != new_path {
+			for node in self.nodes.values_mut() {
+				if let Ok(rel) = node.path.strip_prefix(&old_path) {
+					let rel = rel.to_path_buf();
+					if rel.as_os_str().is_empty() {
+						node.parent = new_parent;
+						node.name = new_os.clone();
+						node.path = new_path.clone();
+					} else {
+						node.path = new_path.join(rel);
+					}
+				}
+			}
+		}
+		Ok(())
 	}
 
 	fn link(&mut self, _: &Context, inode: Inode, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -564,7 +609,7 @@ impl FsState {
 
 	fn release(&mut self, handle: Handle) -> io::Result<()> {
 		match self.handles.remove(&handle) {
-			Some(Resource::File(_)) => Ok(()),
+			Some(Resource::File { .. }) => Ok(()),
 			Some(resource) => {
 				self.handles.insert(handle, resource);
 				Err(errno(libc::EBADF))
@@ -575,16 +620,257 @@ impl FsState {
 
 	fn flush_file(&self, handle: Handle) -> io::Result<completion::File> {
 		match self.handles.get(&handle) {
-			Some(Resource::File(file)) => Ok(file.clone()),
+			Some(Resource::File { file, .. }) => Ok(file.clone()),
 			_ => Err(errno(libc::EBADF)),
 		}
 	}
 
 	fn sync_file(&self, handle: Handle, directory: bool) -> io::Result<completion::File> {
 		match (directory, self.handles.get(&handle)) {
-			(false, Some(Resource::File(file))) => Ok(file.clone()),
+			(false, Some(Resource::File { file, .. })) => Ok(file.clone()),
 			_ => Err(errno(libc::EBADF)),
 		}
+	}
+
+	fn writable_files(&self) -> Vec<completion::File> {
+		self.handles
+			.values()
+			.filter_map(|res| match res {
+				Resource::File { file, flags, .. } if (*flags & O_ACCMODE) != O_RDONLY => {
+					Some(file.clone())
+				}
+				_ => None,
+			})
+			.collect()
+	}
+
+	fn export_state(&self) -> io::Result<Vec<u8>> {
+		use crate::state::{SavedHandle, SavedNode, SavedState, encode};
+
+		let root_path = &self.node(ROOT_ID)?.path;
+		for res in self.handles.values() {
+			let inode = match res {
+				Resource::File { inode, .. } | Resource::Dir { inode, .. } => *inode,
+			};
+			if inode == ROOT_ID {
+				continue;
+			}
+			let node = self.nodes.get(&inode).ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::Unsupported,
+					"cannot snapshot passthrough volume with an open forgotten inode",
+				)
+			})?;
+			let resolved = inspect_path(&node.path).map_err(|_| {
+				io::Error::new(
+					io::ErrorKind::Unsupported,
+					"cannot snapshot passthrough volume with an open unlinked file",
+				)
+			})?;
+			if file_identity(&node.file)? != file_identity(&resolved)? {
+				return Err(io::Error::new(
+					io::ErrorKind::Unsupported,
+					"cannot snapshot passthrough volume with a replaced open file",
+				));
+			}
+		}
+
+		let mut nodes = Vec::with_capacity(self.nodes.len().saturating_sub(1));
+		for (&id, node) in &self.nodes {
+			if id == ROOT_ID {
+				continue;
+			}
+			let rel = node.path.strip_prefix(root_path).map_err(|_| {
+				io::Error::new(io::ErrorKind::InvalidData, "node path escaped root")
+			})?;
+			let mut comps = Vec::new();
+			for comp in rel.components() {
+				let Component::Normal(part) = comp else {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidData,
+						"unexpected non-normal path component",
+					));
+				};
+				comps.push(part.as_encoded_bytes().to_vec());
+			}
+			let meta = node.file.metadata()?;
+			let file_type = if meta.file_type().is_symlink() {
+				S_IFLNK
+			} else if meta.is_dir() {
+				S_IFDIR
+			} else {
+				S_IFREG
+			};
+			nodes.push(SavedNode {
+				id,
+				parent: node.parent,
+				lookups: node.lookups,
+				file_type,
+				path: comps,
+			});
+		}
+		nodes.sort_by_key(|n| (n.path.len(), n.id));
+
+		let mut handles = Vec::with_capacity(self.handles.len());
+		for (&handle, res) in &self.handles {
+			match res {
+				Resource::File { inode, flags, .. } => handles.push(SavedHandle {
+					handle,
+					inode: *inode,
+					is_dir: false,
+					flags: *flags,
+				}),
+				Resource::Dir { inode, .. } => handles.push(SavedHandle {
+					handle,
+					inode: *inode,
+					is_dir: true,
+					flags: O_RDONLY,
+				}),
+			}
+		}
+		handles.sort_by_key(|h| h.handle);
+
+		encode(&SavedState {
+			next_inode: self.next_inode,
+			next_handle: self.next_handle,
+			nodes,
+			handles,
+		})
+	}
+
+	fn import_state(&mut self, bytes: &[u8]) -> io::Result<()> {
+		use std::collections::HashSet;
+
+		let saved = crate::state::decode(bytes)?;
+		if saved.next_inode <= ROOT_ID {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"saved next_inode must exceed ROOT_ID",
+			));
+		}
+
+		let needed_inodes: HashSet<Inode> = saved.handles.iter().map(|h| h.inode).collect();
+		let root_path = self.node(ROOT_ID)?.path.clone();
+		let root_file = inspect_path(&root_path)?;
+		let root_identity = file_identity(&root_file)?;
+
+		let mut nodes = HashMap::with_capacity(saved.nodes.len() + 1);
+		let mut identities = HashMap::with_capacity(saved.nodes.len() + 1);
+		nodes.insert(
+			ROOT_ID,
+			Node {
+				file: root_file,
+				path: root_path.clone(),
+				parent: ROOT_ID,
+				name: OsString::from("."),
+				lookups: 1,
+			},
+		);
+		identities.insert(root_identity, ROOT_ID);
+
+		for sn in saved.nodes {
+			if sn.id == ROOT_ID || sn.id >= saved.next_inode || nodes.contains_key(&sn.id) {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"invalid saved inode id",
+				));
+			}
+			let mut full_path = root_path.clone();
+			let mut last_name = OsString::new();
+			let mut missing = false;
+			for comp in &sn.path {
+				validate_component(comp)?;
+				let os_comp = bytes_to_os(comp)?;
+				full_path.push(&os_comp);
+				last_name = os_comp;
+				match inspect_path(&full_path) {
+					Ok(_) => {}
+					Err(err)
+						if err.kind() == io::ErrorKind::NotFound
+							&& !needed_inodes.contains(&sn.id) =>
+					{
+						missing = true;
+						break;
+					}
+					Err(err) => return Err(err),
+				}
+			}
+			if missing {
+				continue;
+			}
+			let cur = inspect_path(&full_path)?;
+			let meta = cur.metadata()?;
+			let file_type = if meta.file_type().is_symlink() {
+				S_IFLNK
+			} else if meta.is_dir() {
+				S_IFDIR
+			} else {
+				S_IFREG
+			};
+			if file_type != sn.file_type {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"restored inode changed file type on target host",
+				));
+			}
+			let id_pair = file_identity(&cur)?;
+			identities.insert(id_pair, sn.id);
+			nodes.insert(
+				sn.id,
+				Node {
+					file: cur,
+					path: full_path,
+					parent: sn.parent,
+					name: last_name,
+					lookups: sn.lookups.max(1),
+				},
+			);
+		}
+
+		self.nodes = nodes;
+		self.identities = identities;
+		self.next_inode = saved.next_inode;
+		self.handles.clear();
+		self.next_handle = saved.next_handle.max(1);
+
+		for sh in saved.handles {
+			if sh.handle == 0
+				|| sh.handle >= self.next_handle
+				|| self.handles.contains_key(&sh.handle)
+			{
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"invalid saved handle id",
+				));
+			}
+			if sh.is_dir {
+				let path = &self.node(sh.inode)?.path;
+				let mut entries = Vec::new();
+				for item in fs::read_dir(path)? {
+					entries.push(item?.file_name());
+				}
+				self.handles.insert(
+					sh.handle,
+					Resource::Dir {
+						inode: sh.inode,
+						entries,
+					},
+				);
+			} else {
+				let clean_flags = sh.flags & !(O_EXCL | O_TRUNC);
+				let write = (clean_flags & O_ACCMODE) != O_RDONLY;
+				let file = self.reopen(sh.inode, write, clean_flags & O_APPEND != 0, false)?;
+				self.handles.insert(
+					sh.handle,
+					Resource::File {
+						file: completion::File::new(file),
+						inode: sh.inode,
+						flags: clean_flags,
+					},
+				);
+			}
+		}
+		Ok(())
 	}
 
 	fn open_dir(&mut self, _: &Context, inode: Inode) -> io::Result<Handle> {

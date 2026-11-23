@@ -140,6 +140,8 @@ const _: () = {
 pub struct juicefs_mount_options {
 	pub cache_dir: *const ::std::os::raw::c_char,
 	pub subdir: *const ::std::os::raw::c_char,
+	pub restore_state: *const ::std::os::raw::c_char,
+	pub restore_state_len: usize,
 	pub open_cache_ns: u64,
 	pub open_cache_limit: u64,
 	pub heartbeat_ns: u64,
@@ -175,77 +177,81 @@ pub struct juicefs_mount_options {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-	["Size of juicefs_mount_options"][::std::mem::size_of::<juicefs_mount_options>() - 176usize];
+	["Size of juicefs_mount_options"][::std::mem::size_of::<juicefs_mount_options>() - 192usize];
 	["Alignment of juicefs_mount_options"]
 		[::std::mem::align_of::<juicefs_mount_options>() - 8usize];
 	["Offset of field: juicefs_mount_options::cache_dir"]
 		[::std::mem::offset_of!(juicefs_mount_options, cache_dir) - 0usize];
 	["Offset of field: juicefs_mount_options::subdir"]
 		[::std::mem::offset_of!(juicefs_mount_options, subdir) - 8usize];
+	["Offset of field: juicefs_mount_options::restore_state"]
+		[::std::mem::offset_of!(juicefs_mount_options, restore_state) - 16usize];
+	["Offset of field: juicefs_mount_options::restore_state_len"]
+		[::std::mem::offset_of!(juicefs_mount_options, restore_state_len) - 24usize];
 	["Offset of field: juicefs_mount_options::open_cache_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, open_cache_ns) - 16usize];
+		[::std::mem::offset_of!(juicefs_mount_options, open_cache_ns) - 32usize];
 	["Offset of field: juicefs_mount_options::open_cache_limit"]
-		[::std::mem::offset_of!(juicefs_mount_options, open_cache_limit) - 24usize];
+		[::std::mem::offset_of!(juicefs_mount_options, open_cache_limit) - 40usize];
 	["Offset of field: juicefs_mount_options::heartbeat_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, heartbeat_ns) - 32usize];
+		[::std::mem::offset_of!(juicefs_mount_options, heartbeat_ns) - 48usize];
 	["Offset of field: juicefs_mount_options::skip_dir_mtime_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, skip_dir_mtime_ns) - 40usize];
+		[::std::mem::offset_of!(juicefs_mount_options, skip_dir_mtime_ns) - 56usize];
 	["Offset of field: juicefs_mount_options::buffer_size"]
-		[::std::mem::offset_of!(juicefs_mount_options, buffer_size) - 48usize];
+		[::std::mem::offset_of!(juicefs_mount_options, buffer_size) - 64usize];
 	["Offset of field: juicefs_mount_options::max_readahead"]
-		[::std::mem::offset_of!(juicefs_mount_options, max_readahead) - 56usize];
+		[::std::mem::offset_of!(juicefs_mount_options, max_readahead) - 72usize];
 	["Offset of field: juicefs_mount_options::cache_size"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_size) - 64usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_size) - 80usize];
 	["Offset of field: juicefs_mount_options::cache_items"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_items) - 72usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_items) - 88usize];
 	["Offset of field: juicefs_mount_options::cache_scan_interval_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_scan_interval_ns) - 80usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_scan_interval_ns) - 96usize];
 	["Offset of field: juicefs_mount_options::cache_expire_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_expire_ns) - 88usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_expire_ns) - 104usize];
 	["Offset of field: juicefs_mount_options::upload_limit_bps"]
-		[::std::mem::offset_of!(juicefs_mount_options, upload_limit_bps) - 96usize];
+		[::std::mem::offset_of!(juicefs_mount_options, upload_limit_bps) - 112usize];
 	["Offset of field: juicefs_mount_options::download_limit_bps"]
-		[::std::mem::offset_of!(juicefs_mount_options, download_limit_bps) - 104usize];
+		[::std::mem::offset_of!(juicefs_mount_options, download_limit_bps) - 120usize];
 	["Offset of field: juicefs_mount_options::get_timeout_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, get_timeout_ns) - 112usize];
+		[::std::mem::offset_of!(juicefs_mount_options, get_timeout_ns) - 128usize];
 	["Offset of field: juicefs_mount_options::put_timeout_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, put_timeout_ns) - 120usize];
+		[::std::mem::offset_of!(juicefs_mount_options, put_timeout_ns) - 136usize];
 	["Offset of field: juicefs_mount_options::backup_meta_ns"]
-		[::std::mem::offset_of!(juicefs_mount_options, backup_meta_ns) - 128usize];
+		[::std::mem::offset_of!(juicefs_mount_options, backup_meta_ns) - 144usize];
 	["Offset of field: juicefs_mount_options::io_retries"]
-		[::std::mem::offset_of!(juicefs_mount_options, io_retries) - 136usize];
+		[::std::mem::offset_of!(juicefs_mount_options, io_retries) - 152usize];
 	["Offset of field: juicefs_mount_options::max_deletes"]
-		[::std::mem::offset_of!(juicefs_mount_options, max_deletes) - 140usize];
+		[::std::mem::offset_of!(juicefs_mount_options, max_deletes) - 156usize];
 	["Offset of field: juicefs_mount_options::skip_dir_nlink"]
-		[::std::mem::offset_of!(juicefs_mount_options, skip_dir_nlink) - 144usize];
+		[::std::mem::offset_of!(juicefs_mount_options, skip_dir_nlink) - 160usize];
 	["Offset of field: juicefs_mount_options::prefetch"]
-		[::std::mem::offset_of!(juicefs_mount_options, prefetch) - 148usize];
+		[::std::mem::offset_of!(juicefs_mount_options, prefetch) - 164usize];
 	["Offset of field: juicefs_mount_options::max_uploads"]
-		[::std::mem::offset_of!(juicefs_mount_options, max_uploads) - 152usize];
+		[::std::mem::offset_of!(juicefs_mount_options, max_uploads) - 168usize];
 	["Offset of field: juicefs_mount_options::max_downloads"]
-		[::std::mem::offset_of!(juicefs_mount_options, max_downloads) - 156usize];
+		[::std::mem::offset_of!(juicefs_mount_options, max_downloads) - 172usize];
 	["Offset of field: juicefs_mount_options::free_space_permille"]
-		[::std::mem::offset_of!(juicefs_mount_options, free_space_permille) - 160usize];
+		[::std::mem::offset_of!(juicefs_mount_options, free_space_permille) - 176usize];
 	["Offset of field: juicefs_mount_options::read_only"]
-		[::std::mem::offset_of!(juicefs_mount_options, read_only) - 162usize];
+		[::std::mem::offset_of!(juicefs_mount_options, read_only) - 178usize];
 	["Offset of field: juicefs_mount_options::hide_internal"]
-		[::std::mem::offset_of!(juicefs_mount_options, hide_internal) - 163usize];
+		[::std::mem::offset_of!(juicefs_mount_options, hide_internal) - 179usize];
 	["Offset of field: juicefs_mount_options::no_bgjob"]
-		[::std::mem::offset_of!(juicefs_mount_options, no_bgjob) - 164usize];
+		[::std::mem::offset_of!(juicefs_mount_options, no_bgjob) - 180usize];
 	["Offset of field: juicefs_mount_options::fast_statfs"]
-		[::std::mem::offset_of!(juicefs_mount_options, fast_statfs) - 165usize];
+		[::std::mem::offset_of!(juicefs_mount_options, fast_statfs) - 181usize];
 	["Offset of field: juicefs_mount_options::sort_dir"]
-		[::std::mem::offset_of!(juicefs_mount_options, sort_dir) - 166usize];
+		[::std::mem::offset_of!(juicefs_mount_options, sort_dir) - 182usize];
 	["Offset of field: juicefs_mount_options::cache_full_block"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_full_block) - 167usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_full_block) - 183usize];
 	["Offset of field: juicefs_mount_options::cache_checksum"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_checksum) - 168usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_checksum) - 184usize];
 	["Offset of field: juicefs_mount_options::cache_eviction"]
-		[::std::mem::offset_of!(juicefs_mount_options, cache_eviction) - 169usize];
+		[::std::mem::offset_of!(juicefs_mount_options, cache_eviction) - 185usize];
 	["Offset of field: juicefs_mount_options::writeback"]
-		[::std::mem::offset_of!(juicefs_mount_options, writeback) - 170usize];
+		[::std::mem::offset_of!(juicefs_mount_options, writeback) - 186usize];
 	["Offset of field: juicefs_mount_options::backup_skip_trash"]
-		[::std::mem::offset_of!(juicefs_mount_options, backup_skip_trash) - 171usize];
+		[::std::mem::offset_of!(juicefs_mount_options, backup_skip_trash) - 187usize];
 };
 impl Default for juicefs_mount_options {
 	fn default() -> Self {
@@ -559,6 +565,13 @@ unsafe extern "C" {
 	pub fn juicefs_flush_all(
 		h: usize,
 		path: *mut ::std::os::raw::c_char,
+		message: *mut usize,
+	) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+	pub fn juicefs_save_state(
+		h: usize,
+		out: *mut usize,
 		message: *mut usize,
 	) -> ::std::os::raw::c_int;
 }

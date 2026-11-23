@@ -420,7 +420,135 @@ fn hide_internal_and_cache_options() {
 	let payload = vec![7u8; 3 << 20];
 	run(Volume::write(&tuned, Path::new("/payload"), &payload));
 	assert_eq!(run(Volume::read(&tuned, Path::new("/payload"))), payload);
+	// Client-side writeback staging is rejected for offline snapshot migration.
+	assert!(tuned.is_writeback());
+	assert!(try_run(tuned.save_state()).is_err());
 
 	drop((tuned, shown, hidden));
+	drop(fs::remove_dir_all(&dir));
+}
+
+#[test]
+fn save_and_restore_preserves_open_handles_and_sustained_unlinked_files() {
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../target/test-tmp")
+		.join(format!(
+			"boxfs-juicefs-snapshot-test-{}",
+			std::process::id()
+		));
+	drop(fs::remove_dir_all(&dir));
+	let chunks = dir.join("chunks");
+	let cache_a = dir.join("cache-host-a");
+	let cache_b = dir.join("cache-host-b");
+	fs::create_dir_all(&chunks).unwrap();
+	fs::create_dir_all(&cache_a).unwrap();
+	fs::create_dir_all(&cache_b).unwrap();
+
+	let meta = format!("sqlite3://{}", dir.join("meta.db").display());
+	boxfs_juicefs::Volume::format(
+		&meta,
+		&boxfs_juicefs::Format {
+			name: "snapvol".into(),
+			storage: "file".into(),
+			bucket: chunks.display().to_string(),
+			..Default::default()
+		},
+	)
+	.unwrap();
+
+	let ctx = boxfs_juicefs::Ctx::default();
+	let vol_a = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(&cache_a),
+			hide_internal: true,
+			..Default::default()
+		},
+	)
+	.unwrap();
+	assert!(!vol_a.is_writeback());
+
+	// 1. Open a regular file on Host A, write buffered data without releasing.
+	let (live_entry, live_fh) = run(vol_a.create(
+		ctx,
+		1,
+		c"live.txt",
+		0o644,
+		0,
+		(libc::O_CREAT | libc::O_RDWR) as u32,
+	));
+	run(vol_a.write(
+		ctx,
+		live_entry.ino,
+		live_fh,
+		0,
+		b"written-on-host-a".to_vec(),
+	));
+
+	// 2. Create a temporary file, write to it, and unlink its directory entry
+	//    while keeping `unlinked_fh` open (classic Unix open-unlinked pattern).
+	let (unlinked_entry, unlinked_fh) = run(vol_a.create(
+		ctx,
+		1,
+		c"ephemeral.tmp",
+		0o600,
+		0,
+		(libc::O_CREAT | libc::O_RDWR) as u32,
+	));
+	run(vol_a.write(
+		ctx,
+		unlinked_entry.ino,
+		unlinked_fh,
+		0,
+		b"sustained-across-hosts".to_vec(),
+	));
+	run(vol_a.unlink(ctx, 1, c"ephemeral.tmp"));
+
+	// 3. Open root directory handle without releasing.
+	let dir_fh = run(vol_a.opendir(ctx, 1, libc::O_RDONLY as u32));
+
+	// Snapshot Host A and drop its session (simulating Host A VMM exit).
+	let saved = run(vol_a.save_state());
+	assert!(!saved.is_empty());
+	drop(vol_a);
+
+	// Restore on Host B with a completely fresh cache_dir (`cache_b`).
+	let vol_b = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(&cache_b),
+			hide_internal: true,
+			restore_state: Some(&saved),
+			..Default::default()
+		},
+	)
+	.unwrap();
+
+	// 1. Continue reading AND appending through `live_fh` without re-opening!
+	let buf = run(vol_b.read(ctx, live_entry.ino, live_fh, 0, 64));
+	assert_eq!(buf, b"written-on-host-a");
+	run(vol_b.write(
+		ctx,
+		live_entry.ino,
+		live_fh,
+		buf.len() as u64,
+		b"+appended-on-host-b".to_vec(),
+	));
+	let full = run(vol_b.read(ctx, live_entry.ino, live_fh, 0, 64));
+	assert_eq!(full, b"written-on-host-a+appended-on-host-b");
+
+	// 2. Read and write through `unlinked_fh` even though its name was unlinked on Host A!
+	let ubuf = run(vol_b.read(ctx, unlinked_entry.ino, unlinked_fh, 0, 64));
+	assert_eq!(ubuf, b"sustained-across-hosts");
+	assert!(try_run(vol_b.lookup(ctx, 1, c"ephemeral.tmp")).is_err());
+
+	// 3. Readdir through `dir_fh` opened on Host A!
+	let (entries, _) = run(vol_b.readdir(ctx, 1, dir_fh, 0, 4096, true));
+	assert!(entries.iter().any(|e| e.name == b"live.txt"));
+
+	run(vol_b.release(ctx, live_entry.ino, live_fh));
+	run(vol_b.release(ctx, unlinked_entry.ino, unlinked_fh));
+	run(vol_b.releasedir(ctx, 1, dir_fh));
+	drop(vol_b);
 	drop(fs::remove_dir_all(&dir));
 }

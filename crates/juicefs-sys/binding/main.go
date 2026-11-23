@@ -9,6 +9,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -138,6 +140,38 @@ type mountOptions struct {
 	putTimeout        time.Duration
 	backupMeta        time.Duration
 	backupSkipTrash   bool
+	restoreState      []byte
+}
+
+const snapshotVersion uint32 = 1
+
+type snapshotEnvelope struct {
+	Version  uint32          `json:"version"`
+	Sid      uint64          `json:"sid"`
+	VfsState json.RawMessage `json:"vfs_state"`
+}
+
+type dumpedVfsHandles struct {
+	Handler map[uint64]struct {
+		Inode uint64
+		Flags uint32
+	}
+}
+
+// vfsNewMu serializes vfs.NewVFS calls because upstream NewVFS reads process
+// environment `_FUSE_STATE_PATH` (defaulting to `/tmp/state<ppid>.json`) to
+// reload open handles.
+var vfsNewMu sync.Mutex
+
+func createTempStateFile(preferredDir string) (*os.File, error) {
+	if preferredDir != "" {
+		if err := os.MkdirAll(preferredDir, 0o700); err == nil {
+			if f, err := os.CreateTemp(preferredDir, ".juicefs-state-*.json"); err == nil {
+				return f, nil
+			}
+		}
+	}
+	return os.CreateTemp("", "juicefs-state-*.json")
 }
 
 func defaultMountOptions() mountOptions {
@@ -200,6 +234,21 @@ func (m subdirMeta) NewDirHandler(ctx meta.Context, ino meta.Ino, plus bool, ent
 // buildVFS replicates the essential stage-3 mount flow of upstream
 // cmd/mount.go: meta client, object storage, cached chunk store, VFS.
 func buildVFS(payload string, opts mountOptions) (*vfs.VFS, object.ObjectStorage, error) {
+	var restored *snapshotEnvelope
+	if len(opts.restoreState) > 0 {
+		var env snapshotEnvelope
+		if err := json.Unmarshal(opts.restoreState, &env); err != nil {
+			return nil, nil, fmt.Errorf("decode juicefs snapshot state: %w", err)
+		}
+		if env.Version != snapshotVersion {
+			return nil, nil, fmt.Errorf("unsupported juicefs snapshot version %d", env.Version)
+		}
+		if len(env.VfsState) == 0 {
+			return nil, nil, fmt.Errorf("juicefs snapshot state carries empty vfs_state")
+		}
+		restored = &env
+	}
+
 	subdir := path.Clean("/" + opts.subdir)
 	if subdir == "/" {
 		subdir = ""
@@ -217,6 +266,9 @@ func buildVFS(payload string, opts mountOptions) (*vfs.VFS, object.ObjectStorage
 	metaConf.FastStatfs = opts.fastStatfs
 	metaConf.SortDir = opts.sortDir
 	metaConf.MountPoint = "/jfs" // log wording only; nothing is mounted
+	if restored != nil && restored.Sid != 0 {
+		metaConf.Sid = restored.Sid
+	}
 
 	metaCli := meta.NewClient(payload, metaConf)
 	format, err := metaCli.Load(true)
@@ -333,5 +385,62 @@ func buildVFS(payload string, opts mountOptions) (*vfs.VFS, object.ObjectStorage
 	if subdir != "" {
 		metaCli = subdirMeta{metaCli}
 	}
-	return vfs.NewVFS(vfsConf, metaCli, store, registry, registry), blob, nil
+
+	var restorePath string
+	if restored != nil {
+		var parsed dumpedVfsHandles
+		if err := json.Unmarshal(restored.VfsState, &parsed); err != nil {
+			_ = metaCli.Shutdown()
+			object.Shutdown(blob)
+			return nil, nil, fmt.Errorf("invalid juicefs vfs handle table: %w", err)
+		}
+		tmpFile, err := createTempStateFile(cacheDir)
+		if err != nil {
+			_ = metaCli.Shutdown()
+			object.Shutdown(blob)
+			return nil, nil, fmt.Errorf("stage juicefs restore state: %w", err)
+		}
+		restorePath = tmpFile.Name()
+		if _, err := tmpFile.Write(restored.VfsState); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(restorePath)
+			_ = metaCli.Shutdown()
+			object.Shutdown(blob)
+			return nil, nil, fmt.Errorf("write juicefs restore state: %w", err)
+		}
+		if err := tmpFile.Close(); err != nil {
+			_ = os.Remove(restorePath)
+			_ = metaCli.Shutdown()
+			object.Shutdown(blob)
+			return nil, nil, fmt.Errorf("close juicefs restore state: %w", err)
+		}
+		const clearCreateFlags = ^uint32(syscall.O_CREAT | syscall.O_EXCL | syscall.O_TRUNC)
+		for _, h := range parsed.Handler {
+			var a meta.Attr
+			if metaCli.GetAttr(meta.Background(), meta.Ino(h.Inode), &a) == 0 && a.Typ == meta.TypeFile {
+				_ = metaCli.Open(meta.Background(), meta.Ino(h.Inode), h.Flags&clearCreateFlags, &a)
+			}
+		}
+	}
+
+	vfsNewMu.Lock()
+	prevStateEnv, hadStateEnv := os.LookupEnv("_FUSE_STATE_PATH")
+	stateEnv := restorePath
+	if stateEnv == "" {
+		stateEnv = filepath.Join(cacheDir, ".juicefs-nostate-"+uuid.NewString()+".json")
+	}
+	_ = os.Setenv("_FUSE_STATE_PATH", stateEnv)
+	v := vfs.NewVFS(vfsConf, metaCli, store, registry, registry)
+	if hadStateEnv {
+		_ = os.Setenv("_FUSE_STATE_PATH", prevStateEnv)
+	} else {
+		_ = os.Unsetenv("_FUSE_STATE_PATH")
+	}
+	vfsNewMu.Unlock()
+
+	if restorePath != "" {
+		_ = os.Remove(restorePath)
+		_ = os.Remove(restorePath + ".bak")
+	}
+	return v, blob, nil
 }
