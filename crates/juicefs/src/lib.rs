@@ -38,8 +38,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-	Context, CreateArgs, DirentInfo, Fuse, GetxattrReply, Kstatfs, ListxattrReply,
-	Volume as VolumeApi, WalkEntry, ZeroCopyReader, ZeroCopyWriter, name_to_path,
+	BoxFuture, Context, CreateArgs, DirentInfo, Fuse, GetxattrReply, Kstatfs, ListxattrReply,
+	Volume as VolumeApi, VolumeWriter, WalkEntry, ZeroCopyReader, ZeroCopyWriter, name_to_path,
 };
 use api::{IndexOptions, Search, SearchIndex};
 use asyncband::oneshot;
@@ -2401,6 +2401,92 @@ impl VolumeApi for Volume {
 		Ok(())
 	}
 
+	async fn open_write<'v>(&'v self, path: &Path) -> io::Result<Box<dyn VolumeWriter<'v> + 'v>> {
+		let path_buf = path.to_path_buf();
+		let (ino, fh) = self
+			.call(move |handle| {
+				let ctx = Ctx::default();
+				let (parent, name) = sync_resolve_parent(handle, &ctx, &path_buf)?;
+				match sync_lookup(handle, &ctx, parent, &name) {
+					Ok(existing) => {
+						if existing.attr.typ == TYPE_DIRECTORY {
+							return Err(io::Error::from_raw_os_error(libc::EISDIR));
+						}
+						if existing.attr.typ != TYPE_REGULAR {
+							return Err(io::Error::from_raw_os_error(libc::EPERM));
+						}
+						let mut opened = Entry::default();
+						let mut fh = 0u64;
+						check(unsafe {
+							binding::juicefs_open(
+								handle,
+								mut_ptr(&ctx),
+								existing.ino,
+								(libc::O_WRONLY | libc::O_TRUNC) as u32,
+								&mut opened,
+								&mut fh,
+							)
+						})?;
+						if existing.attr.length > 0 {
+							// The metadata engine ignores `O_TRUNC` on open, and
+							// `truncate` is the one call every platform has.
+							let mut out = Attr::default();
+							let trunc_res = check(unsafe {
+								binding::juicefs_truncate(
+									handle,
+									mut_ptr(&ctx),
+									existing.ino,
+									0,
+									fh,
+									&mut out,
+								)
+							});
+							if let Err(err) = trunc_res {
+								unsafe {
+									binding::juicefs_release(
+										handle,
+										mut_ptr(&ctx),
+										existing.ino,
+										fh,
+									)
+								};
+								return Err(err);
+							}
+						}
+						Ok((existing.ino, fh))
+					}
+					Err(_) => {
+						let mut created = Entry::default();
+						let mut fh = 0u64;
+						check(unsafe {
+							binding::juicefs_create(
+								handle,
+								mut_ptr(&ctx),
+								parent,
+								name.as_ptr().cast_mut(),
+								0o644,
+								0,
+								libc::O_WRONLY as u32,
+								&mut created,
+								&mut fh,
+							)
+						})?;
+						Ok((created.ino, fh))
+					}
+				}
+			})
+			.await?;
+		Ok(Box::new(JuicefsWriter {
+			vol: self,
+			path: path.to_path_buf(),
+			ino,
+			fh,
+			offset: 0,
+			finished: false,
+			index_buf: self.index.is_some().then(Vec::new),
+		}))
+	}
+
 	async fn stat(&self, path: &Path) -> io::Result<api::Attr> {
 		let path = path.to_path_buf();
 		self.call(move |handle| {
@@ -2690,6 +2776,113 @@ impl VolumeApi for Volume {
 			idx.notify_reset();
 		}
 		Ok(())
+	}
+}
+
+const STREAM_INDEX_LIMIT: usize = 16 * 1024 * 1024;
+
+struct JuicefsWriter<'v> {
+	vol: &'v Volume,
+	path: PathBuf,
+	ino: u64,
+	fh: u64,
+	offset: u64,
+	finished: bool,
+	index_buf: Option<Vec<u8>>,
+}
+
+impl<'v> VolumeWriter<'v> for JuicefsWriter<'v> {
+	fn write_all<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
+		Box::pin(async move {
+			if data.is_empty() {
+				return Ok(());
+			}
+			if let Some(buf) = &mut self.index_buf {
+				if buf.len().saturating_add(data.len()) <= STREAM_INDEX_LIMIT {
+					buf.extend_from_slice(data);
+				} else {
+					self.index_buf = None;
+				}
+			}
+			let offset = self.offset;
+			let len = data.len();
+			let chunk = data.to_vec();
+			let ino = self.ino;
+			let fh = self.fh;
+			self.vol
+				.call(move |handle| {
+					let ctx = Ctx::default();
+					check(unsafe {
+						binding::juicefs_write(
+							handle,
+							mut_ptr(&ctx),
+							ino,
+							fh,
+							offset,
+							chunk.as_ptr().cast::<c_char>().cast_mut(),
+							chunk.len(),
+						)
+					})
+				})
+				.await?;
+			self.offset += len as u64;
+			Ok(())
+		})
+	}
+
+	fn finish(mut self: Box<Self>) -> BoxFuture<'v, io::Result<()>> {
+		Box::pin(async move {
+			self.finished = true;
+			let ino = self.ino;
+			let fh = self.fh;
+			let vol = self.vol;
+			let path = std::mem::take(&mut self.path);
+			let index_buf = self.index_buf.take();
+			vol.call(move |handle| {
+				let ctx = Ctx::default();
+				let flush_res =
+					check(unsafe { binding::juicefs_flush(handle, mut_ptr(&ctx), ino, fh, 0) });
+				unsafe { binding::juicefs_release(handle, mut_ptr(&ctx), ino, fh) };
+				flush_res
+			})
+			.await?;
+			if let (Some(idx), Some(buf)) = (&vol.index, index_buf) {
+				let attr = VolumeApi::stat(vol, &path).await?;
+				for (name, raw) in idx.notify_write(&path, &attr, &buf) {
+					let _result = VolumeApi::setxattr(vol, &path, name, &raw, 0).await;
+				}
+				idx.persist_roots(vol).await;
+			}
+			Ok(())
+		})
+	}
+}
+
+impl Drop for JuicefsWriter<'_> {
+	fn drop(&mut self) {
+		if self.finished {
+			return;
+		}
+		let ino = self.ino;
+		let fh = self.fh;
+		let raw = Box::into_raw(Box::new(DispatchedTask {
+			handle: self.vol.handle,
+			run: Box::new(move |handle| {
+				let ctx = Ctx::default();
+				unsafe { binding::juicefs_release(handle, mut_ptr(&ctx), ino, fh) };
+			}),
+		}));
+		let code = unsafe {
+			binding::juicefs_dispatch(
+				self.vol.handle,
+				Some(dispatch_trampoline),
+				raw.cast::<c_void>(),
+				0,
+			)
+		};
+		if code != 0 {
+			drop(unsafe { Box::from_raw(raw) });
+		}
 	}
 }
 

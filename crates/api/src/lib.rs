@@ -13,7 +13,7 @@ pub use fuse::{
 	ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
 };
 pub use memory::{Memory, MemoryRange};
-pub use volume::{SubVolume, Volume, WalkEntry, name_to_path};
+pub use volume::{BoxFuture, SubVolume, Volume, VolumeWriter, WalkEntry, name_to_path};
 
 pub use search::{
 	ContentIndex, FileSignatures, FileStamp, IndexOptions, PageSig, PathIndex, SEARCH_OVERLAP,

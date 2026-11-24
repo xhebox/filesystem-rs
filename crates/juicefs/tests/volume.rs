@@ -552,3 +552,61 @@ fn save_and_restore_preserves_open_handles_and_sustained_unlinked_files() {
 	drop(vol_b);
 	drop(fs::remove_dir_all(&dir));
 }
+
+#[test]
+fn open_write_streams_chunks_and_truncates() {
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../target/test-tmp")
+		.join(format!("boxfs-juicefs-stream-test-{}", std::process::id()));
+	drop(fs::remove_dir_all(&dir));
+	fs::create_dir_all(dir.join("chunks")).unwrap();
+	let meta = format!("sqlite3://{}", dir.join("meta.db").display());
+	boxfs_juicefs::Volume::format(
+		&meta,
+		&boxfs_juicefs::Format {
+			name: "stream".into(),
+			storage: "file".into(),
+			bucket: dir.join("chunks").display().to_string(),
+			..Default::default()
+		},
+	)
+	.unwrap();
+	let cache = dir.join("cache");
+	let vol = boxfs_juicefs::Volume::mount(
+		&meta,
+		MountOptions {
+			cache_dir: Some(&cache),
+			..Default::default()
+		},
+	)
+	.unwrap();
+
+	run(async {
+		// Create new file via multiple chunks.
+		let mut w = Volume::open_write(&vol, Path::new("/stream.bin")).await?;
+		w.write_all(b"hello-").await?;
+		w.write_all(b"").await?;
+		w.write_all(b"streaming-world").await?;
+		w.finish().await?;
+
+		let got = Volume::read(&vol, Path::new("/stream.bin")).await?;
+		assert_eq!(got, b"hello-streaming-world");
+
+		// Re-open existing file truncates old contents.
+		let mut w2 = Volume::open_write(&vol, Path::new("/stream.bin")).await?;
+		w2.write_all(b"short").await?;
+		w2.finish().await?;
+
+		let got2 = Volume::read(&vol, Path::new("/stream.bin")).await?;
+		assert_eq!(got2, b"short");
+
+		// Drop without finish releases handle cleanly.
+		let mut w3 = Volume::open_write(&vol, Path::new("/aborted.bin")).await?;
+		w3.write_all(b"partial").await?;
+		drop(w3);
+		Ok::<_, std::io::Error>(())
+	});
+
+	drop(vol);
+	drop(fs::remove_dir_all(&dir));
+}

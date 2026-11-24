@@ -1,13 +1,30 @@
 //! Path-addressed [`Volume`] operations for callers outside a guest.
 
 use std::ffi::CStr;
+use std::future::Future;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 
 use crate::fuse::{Attr, DirEntry, unsupported};
 
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
+
+/// Boxed future used by [`VolumeWriter`] to remain runtime-agnostic.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Sequential streaming writer returned by [`Volume::open_write`].
+///
+/// Dropping a writer without calling [`finish`](VolumeWriter::finish) releases
+/// the underlying handle without guaranteeing flush.
+pub trait VolumeWriter<'v>: Send {
+	/// Appends `data` at the current sequential write offset.
+	fn write_all<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, io::Result<()>>;
+
+	/// Flushes and closes the underlying file handle.
+	fn finish(self: Box<Self>) -> BoxFuture<'v, io::Result<()>>;
+}
 
 /// An entry beneath the root of a [`Volume::walk`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +99,12 @@ pub trait Volume {
 	/// Writes `data` to `path`, creating the file if absent or truncating it if
 	/// present.
 	async fn write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+		Err(unsupported())
+	}
+
+	/// Opens `path` for sequential streaming writes, creating the file if
+	/// absent or truncating it if present.
+	async fn open_write<'v>(&'v self, _path: &Path) -> io::Result<Box<dyn VolumeWriter<'v> + 'v>> {
 		Err(unsupported())
 	}
 
@@ -180,6 +203,10 @@ impl<V: Volume + ?Sized> Volume for &V {
 
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		(**self).write(path, data).await
+	}
+
+	async fn open_write<'v>(&'v self, path: &Path) -> io::Result<Box<dyn VolumeWriter<'v> + 'v>> {
+		(**self).open_write(path).await
 	}
 
 	async fn stat(&self, path: &Path) -> io::Result<Attr> {
@@ -333,6 +360,11 @@ impl<V: Volume> Volume for SubVolume<V> {
 	async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
 		let path = self.resolve(path)?;
 		self.inner.write(&path, data).await
+	}
+
+	async fn open_write<'v>(&'v self, path: &Path) -> io::Result<Box<dyn VolumeWriter<'v> + 'v>> {
+		let path = self.resolve(path)?;
+		self.inner.open_write(&path).await
 	}
 
 	async fn stat(&self, path: &Path) -> io::Result<Attr> {
